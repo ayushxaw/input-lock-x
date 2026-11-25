@@ -22,7 +22,9 @@ DAEMON='/usr/local/bin/input-lock-x-daemon'
 # process, and status, PIN setup and help cannot hold a grab.
 daemon_pids() {
     for dir in /proc/[0-9]*; do
-        [ -O "$dir" ] && [ -r "$dir/cmdline" ] || continue
+        if [ ! -O "$dir" ] || [ ! -r "$dir/cmdline" ]; then
+            continue
+        fi
         if /usr/bin/awk -v daemon="$DAEMON" '
             BEGIN { RS = "\0" }
             NR == 1 { python = $0 ~ /(^|\/)python3([.][0-9]+)?$/ }

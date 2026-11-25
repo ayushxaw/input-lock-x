@@ -473,11 +473,10 @@ say "Preparing the daemon and Lock X PIN (sudo)"
 (
     stage="$(sudo mktemp -d "$(dirname "$DAEMON_BIN")/.input-lock-x.XXXXXXXX")"
     staged_daemon="$stage/input-lock-x-daemon"
-    clean_stage() {
+    trap '
         sudo -n rm -f -- "$staged_daemon" 2>/dev/null || true
         sudo -n rmdir -- "$stage" 2>/dev/null || true
-    }
-    trap clean_stage EXIT
+    ' EXIT
     sudo install -m 0755 "$REPO/daemon/input-lock-x-daemon.py" "$staged_daemon"
     if ! sudo "$staged_daemon" --pin-configured; then
         echo "   Choose a separate PIN for Input Lock X."
