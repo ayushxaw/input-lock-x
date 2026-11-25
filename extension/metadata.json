@@ -1,9 +1,9 @@
 {
   "name": "Input Lock X",
-  "description": "GNOME Shell extension for Linux tablet mode that temporarily disables a convertible laptop's built-in keyboard and touchpad on Wayland or X11.\n\nRequires the companion Input Lock X root daemon, installed separately from https://github.com/isalin/input-lock-x. The extension cannot access /dev/input directly; without the daemon, the panel icon reports that it is unavailable instead of failing silently.",
+  "description": "Lock keyboard and pointer input while keeping your screen awake. Unlock with your separate Lock X PIN. Requires the Input Lock X system daemon.",
   "uuid": "input-lock-x@isalin.github.io",
   "settings-schema": "org.gnome.shell.extensions.input-lock-x",
-  "url": "https://github.com/isalin/input-lock-x",
+  "url": "https://github.com/ayushxaw/input-lock-x",
   "shell-version": [
     "45",
     "46",
@@ -12,5 +12,6 @@
     "49",
     "50"
   ],
-  "version-name": "1.0.0"
+  "version-name": "1.0.0",
+  "x-modified-by": "ayushxaw, 2026-11-25"
 }

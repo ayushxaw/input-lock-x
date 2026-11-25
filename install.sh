@@ -30,6 +30,8 @@
 #                     to ask at.
 #                     For developing on the extension itself.
 
+# PIN enrollment and daemon upgrade changes by ayushxaw, 2026-11-25.
+
 set -euo pipefail
 
 # pwd -P, not pwd: bash's pwd is logical, so a checkout reached through a
@@ -294,6 +296,11 @@ else
          "in $POLKIT_RULE after installing."
 fi
 
+if systemctl is-active --quiet "$UNIT" || [[ -e "$STATE" ]]; then
+    echo "Release Lock X before running the installer." >&2
+    exit 1
+fi
+
 # --------------------------------------------------------------------------
 # Migrate from the pre-rename generation, if this machine has one. Everything
 # below is a no-op on a fresh install.
@@ -460,9 +467,29 @@ if [[ $EXT_IS_REPO -eq 1 ]]; then
     fi
 fi
 
-say "Installing system components (sudo)"
-sudo install -m 0755 "$REPO/daemon/input-lock-x-daemon.py" "$DAEMON_BIN"
+say "Preparing the daemon and Lock X PIN (sudo)"
+# Complete PIN enrollment before replacing the daemon. Keeping the staging
+# file in the destination directory makes the replacement atomic.
+(
+    stage="$(sudo mktemp -d "$(dirname "$DAEMON_BIN")/.input-lock-x.XXXXXXXX")"
+    staged_daemon="$stage/input-lock-x-daemon"
+    clean_stage() {
+        sudo -n rm -f -- "$staged_daemon" 2>/dev/null || true
+        sudo -n rmdir -- "$stage" 2>/dev/null || true
+    }
+    trap clean_stage EXIT
+    sudo install -m 0755 "$REPO/daemon/input-lock-x-daemon.py" "$staged_daemon"
+    if ! sudo "$staged_daemon" --pin-configured; then
+        echo "   Choose a separate PIN for Input Lock X."
+        sudo "$staged_daemon" --set-pin
+    fi
+    sudo mv -fT -- "$staged_daemon" "$DAEMON_BIN"
+    sudo rmdir -- "$stage"
+    trap - EXIT
+)
 echo "   $DAEMON_BIN"
+
+say "Installing system components (sudo)"
 
 
 # install(1) gives the file the target directory's default context, which is
@@ -486,12 +513,14 @@ echo "   $UNIT_FILE"
 # and GNU install -d applies its mode to an existing directory too -- which
 # would silently make it world-readable and never put it back.
 sudo install -m 0644 "$REPO/daemon/49-input-lock-x.rules" "$POLKIT_RULE"
-echo "   $POLKIT_RULE (wheel, sudo or admin may toggle)"
+echo "   $POLKIT_RULE (wheel, sudo or admin may engage the lock)"
 
 sudo install -m 0755 "$REPO/scripts/input-lock-x" "$CLI"
 sudo install -m 0755 "$REPO/scripts/input-lock-x-emergency-unlock" "$UNLOCK"
 echo "   $CLI"
 echo "   $UNLOCK"
+# Remove the helper used by the earlier password-gated release flow.
+sudo rm -f "$PASSWORD_UNLOCK"
 
 if [[ $INSTALL_SUDOERS -eq 1 ]]; then
     # Without this, `ssh laptop input-lock-x-emergency-unlock` has no TTY for sudo to
@@ -526,16 +555,6 @@ sudo "$DAEMON_BIN" --list
 # Start the unit for real, which is the check that actually matters.
 say "Verifying the service can grab (engages the lock briefly)"
 
-# Was input already locked before this install touched anything? Nothing above
-# starts or stops this unit, and the block below ends with it stopped whichever
-# way it goes -- so a user who had the lock engaged loses it here, and without
-# this flag nothing would tell them apart from the test lock we engage
-# ourselves.
-lock_was_engaged=0
-if systemctl is-active --quiet "$UNIT" || [[ -e "$STATE" ]]; then
-    lock_was_engaged=1
-fi
-
 # One sudo, not three or four. This is the only moment in the install where
 # input is genuinely locked, and the credential cache is not guaranteed to be
 # warm -- `Defaults timestamp_timeout=0` is a real configuration, and under it
@@ -565,16 +584,6 @@ systemctl kill --signal=KILL input-lock-x.service
 rm -f /run/input-lock-x.state
 exit 12
 VERIFY
-
-# Before the case, because every outcome below -- including the ones that exit
-# -- has left a pre-existing lock released: restart stops the running daemon
-# before it starts a new one, and each failure path ends with the unit down.
-if [[ $lock_was_engaged -eq 1 ]]; then
-    echo "   NOTE: input was already locked when this install started."
-    echo "   Verifying restarted the daemon, so that lock is gone and the"
-    echo "   keyboard and touchpad are live again. Re-engage it with:"
-    echo "     input-lock-x on"
-fi
 
 case $verify_rc in
     0)

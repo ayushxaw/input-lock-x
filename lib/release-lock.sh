@@ -1,5 +1,6 @@
 # Copyright (C) 2026 Isak Lindgren
 # SPDX-License-Identifier: GPL-2.0-or-later
+# Recovery excludes PIN commands and version checks by ayushxaw, 2026-11-25.
 #
 # Make certain nothing is still holding an EVIOCGRAB on this machine's input.
 # shellcheck shell=bash
@@ -52,7 +53,9 @@ stray_daemon_pids() {  # stray_daemon_pids <daemon-pattern>
         # process that exits mid-scan.
         cmdline="$(tr '\0' ' ' 2>/dev/null <"$dir/cmdline")" || continue
         [[ "$cmdline" == *"$pattern"* ]] || continue
-        [[ "$cmdline" == *--list* ]] && continue
+        case "$cmdline" in
+            *--list*|*--protocol-version*|*--pin-configured*|*--set-pin*) continue ;;
+        esac
         echo "$pid"
     done
 

@@ -1,9 +1,9 @@
 // Copyright (C) 2026 Isak Lindgren
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Updated permission to engage the lock by ayushxaw, 2026-11-25.
 //
-// Let an active local session in an administrator group start and stop the
-// input lock unit without a password prompt -- a password prompt is useless
-// when the keyboard is the thing being disabled.
+// Let an active local session in an administrator group engage the lock.
+// Normal desktop unlock is handled by the daemon's PIN flow.
 //
 // Scoped to this single unit: it grants no other systemd control. It also
 // requires an active local seat, so it cannot be used over SSH (the
@@ -17,6 +17,7 @@
 polkit.addRule(function (action, subject) {
     if (action.id == "org.freedesktop.systemd1.manage-units" &&
         action.lookup("unit") == "input-lock-x.service" &&
+        action.lookup("verb") == "start" &&
         subject.local && subject.active &&
         (subject.isInGroup("wheel") ||
          subject.isInGroup("sudo") ||

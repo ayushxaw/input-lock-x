@@ -1,12 +1,13 @@
 #!/usr/bin/python3
 # Copyright (C) 2026 Isak Lindgren
 # SPDX-License-Identifier: GPL-2.0-or-later
+# PIN unlock, device recovery, and watchdog support by ayushxaw, 2026-11-25.
 """Input Lock X daemon.
 
 Takes an exclusive EVIOCGRAB on the internal keyboard and pointers so that no
 input from them reaches the compositor or any application. Because the grab is
 exclusive to this process, this daemon is the only thing that can still see the
-keyboard -- so it watches its own raw event stream for Ctrl+Esc and releases.
+keyboard -- so it handles Ctrl+Esc PIN entry and Ctrl+A+Esc recovery locally.
 
 A grab lives and dies with the file descriptor: if this process is killed the
 kernel releases it automatically. That is the failsafe, and the reason this is
@@ -18,26 +19,44 @@ Runs as root via input-lock-x.service. Stdlib only.
 import argparse
 import configparser
 import ctypes
+import getpass
+import hashlib
+import hmac
 import errno
 import fcntl
 import glob
 import os
 import select
 import signal
+import stat
 import socket
 import struct
 import sys
+import tempfile
 import time
+import warnings
 from fnmatch import fnmatch
 
 CONFIG_PATH = "/etc/input-lock-x.conf"
 STATE_PATH = "/run/input-lock-x.state"
+AUTH_PATH = "/run/input-lock-x.auth"
+PIN_PATH = "/etc/input-lock-x.pin"
+PIN_IDLE_SECONDS = 30
+PIN_RETRY_SECONDS = 1
+PIN_ITERATIONS = 600_000
+PIN_SALT_BYTES = 16
+PIN_HASH_BYTES = 32
+MAX_PIN_DIGITS = 12
+INPUT_GLOB = "/dev/input/event*"
 
 # struct input_event: struct timeval (2x long) + type + code + value. Native
 # sizes, so this is correct on 32- and 64-bit alike.
 EVENT_STRUCT = struct.Struct("llHHi")
 EVENT_SIZE = EVENT_STRUCT.size
 
+EV_SYN = 0x00
+SYN_REPORT = 0
+SYN_DROPPED = 3
 EV_KEY = 0x01
 EV_REL = 0x02
 EV_ABS = 0x03
@@ -99,7 +118,13 @@ KEY_Z = 44
 KEY_SPACE = 57
 KEYBOARD_PROBE_KEYS = (KEY_1, KEY_ENTER, KEY_A, KEY_Z, KEY_SPACE)
 
-CTRL_KEYS = (KEY_LEFTCTRL, KEY_RIGHTCTRL)
+CTRL_KEYS = frozenset((KEY_LEFTCTRL, KEY_RIGHTCTRL))
+KEY_BACKSPACE = 14
+KEY_KPENTER = 96
+
+# Linux evdev codes are physical key positions, independent of Num Lock.
+DIGIT_KEYS = dict(zip(range(2, 12), "1234567890"))
+DIGIT_KEYS.update(zip((82, 79, 80, 81, 75, 76, 77, 71, 72, 73), "0123456789"))
 
 # Keys whose held state actually matters when we grab or ungrab: the modifiers,
 # which the compositor latches, plus the Esc of the Ctrl+Esc that got us here.
@@ -116,6 +141,9 @@ STICKY_KEYS = (
     KEY_LEFTMETA, KEY_RIGHTMETA,
 )
 
+CHORD_KEYS = frozenset(STICKY_KEYS) | {KEY_A}
+OTHER_MODIFIERS = frozenset(STICKY_KEYS) - CTRL_KEYS - {KEY_ESC}
+
 # Covers key codes 0..255, i.e. the KEY_* range. BTN_* codes start at 0x100, so
 # this also keeps BTN_TOUCH and BTN_LEFT out of the picture.
 KEY_BITMAP_BYTES = 32
@@ -126,8 +154,11 @@ KEY_CAP_BYTES = 96
 
 # _drain() outcomes.
 DRAIN_OK = "ok"
-DRAIN_RELEASE = "release"
 DRAIN_DEAD = "dead"
+DRAIN_RELEASE = "release"
+DRAIN_FORCE_RELEASE = "force-release"
+DEVICE_FAULT = select.POLLERR | select.POLLHUP | select.POLLNVAL
+SCAN_SECONDS = 1
 
 # _IOC encoding, from <asm-generic/ioctl.h>
 _IOC_NRBITS = 8
@@ -197,6 +228,18 @@ def sd_notify(state):
             sock.sendall(state.encode())
     except OSError as exc:
         log(f"sd_notify({state!r}) failed: {exc}")
+
+
+def watchdog_interval():
+    """Seconds between systemd watchdog notifications, or None."""
+    try:
+        target = int(os.environ.get("WATCHDOG_PID") or os.getpid())
+        period = int(os.environ.get("WATCHDOG_USEC", "0"))
+        if target == os.getpid() and period > 0:
+            return period / 2_000_000
+    except (ValueError, OverflowError):
+        pass
+    return None
 
 
 def device_name(fd):
@@ -487,35 +530,46 @@ def decide(info, config):
     return True, f"internal {info.kind}"
 
 
+def device_identity(file_stat):
+    return file_stat.st_dev, file_stat.st_ino
+
+
+def can_recover(info):
+    return (bit_is_set(info.keys, KEY_ESC) and bit_is_set(info.keys, KEY_A)
+            and any(bit_is_set(info.keys, code) for code in CTRL_KEYS))
+
+
+def open_device(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        name = device_name(fd)
+        if name is not None:
+            info = DeviceInfo(path, fd, name)
+            info.identity = device_identity(os.fstat(fd))
+            return info
+    except BaseException:
+        os.close(fd)
+        raise
+    os.close(fd)
+    return None
+
+
 def inspect_devices(config):
-    """Open every event device and decide its fate.
-
-    Returns (decisions, denied) where decisions is [(info, grab, reason)] with
-    every fd still open, and denied counts the devices that could not be opened
-    for lack of permission -- that failure looks identical to "nothing matched"
-    from the outside and has a completely different cause.
-
-    The caller owns every fd and must close the ones it does not keep.
-    """
+    """Return device decisions with fds open, plus the permission-denied count."""
     decisions = []
     denied = 0
-    for path in sorted(glob.glob("/dev/input/event*")):
+    for path in sorted(glob.glob(INPUT_GLOB)):
         try:
-            fd = os.open(path, os.O_RDONLY)
+            info = open_device(path)
         except OSError as exc:
             if exc.errno in (errno.EACCES, errno.EPERM):
                 denied += 1
             log(f"cannot open {path}: {exc}")
             continue
 
-        name = device_name(fd)
-        if name is None:
-            os.close(fd)
-            continue
-
-        info = DeviceInfo(path, fd, name)
-        grab, reason = decide(info, config)
-        decisions.append((info, grab, reason))
+        if info is not None:
+            grab, reason = decide(info, config)
+            decisions.append((info, grab, reason))
     return decisions, denied
 
 
@@ -536,12 +590,7 @@ def find_devices(config):
 
 
 def escape_routes(decisions):
-    """The ways back in that need no keyboard at all.
-
-    Ctrl+Esc is not listed: it always works, because the daemon watches for it
-    in its own grabbed stream. This is about what is left when the keyboard is
-    face down on a table, which is the situation this tool exists for.
-    """
+    """Report physical input devices that will remain usable during a grab."""
     # A uinput node has nothing physical behind it, so it is never a way back
     # in -- and auto mode leaves every one of them ungrabbed, which means
     # without this filter a machine running input-remapper or a remote-desktop
@@ -553,9 +602,9 @@ def escape_routes(decisions):
 
     routes = []
     if live(CLASS_TOUCHSCREEN):
-        routes.append("the touchscreen (tap the panel icon)")
+        routes.append("the touchscreen")
     if live(CLASS_POINTER):
-        routes.append("an ungrabbed pointer (click the panel icon)")
+        routes.append("an ungrabbed pointer")
     if live(CLASS_KEYBOARD):
         routes.append("an ungrabbed keyboard")
     return routes
@@ -566,15 +615,15 @@ def log_safety_notes(decisions):
     for info, grab, _reason in decisions:
         if grab and info.kind == CLASS_TOUCHSCREEN:
             log(f"WARNING: {info.name} is a touchscreen and a pattern matched "
-                f"it; the panel icon will not be tappable while locked")
+                "it; touch input will be disabled while locked")
 
     routes = escape_routes(decisions)
     if routes:
-        log("ways back without the keyboard: " + ", ".join(routes))
+        log("live input during the lock: " + ", ".join(routes))
     else:
         log("WARNING: nothing usable stays live -- no touchscreen, pointer or "
             "spare keyboard")
-        log("WARNING: the only ways back will be Ctrl+Esc and SSH from another "
+        log("WARNING: the only ways back will be Ctrl+A+Esc and SSH from another "
             "machine")
 
 
@@ -588,19 +637,19 @@ def read_key_bitmap(fd):
     return buf
 
 
-def held_sticky_keys(fds):
-    """The STICKY_KEYS currently held down across the given devices."""
+def held_sticky_keys(fds, keys=STICKY_KEYS):
+    """Which of the given keys are held down across the devices."""
     held = set()
     for fd in fds:
         bitmap = read_key_bitmap(fd)
         if bitmap is None:
             continue
-        held.update(code for code in STICKY_KEYS if bit_is_set(bitmap, code))
+        held.update(code for code in keys if bit_is_set(bitmap, code))
     return held
 
 
-def wait_for_sticky_keys_released(fds, timeout=2.0):
-    """Block until no modifier (or Esc) is held, or until timeout.
+def wait_for_sticky_keys_released(fds, timeout=2.0, keys=STICKY_KEYS):
+    """Block until the specified keys are up or the timeout elapses.
 
     This matters at both ends of a lock. We are normally invoked *from* the
     Ctrl+Esc binding, so both keys are still physically down and the compositor
@@ -608,12 +657,12 @@ def wait_for_sticky_keys_released(fds, timeout=2.0):
     never sees the release and is left with a stuck Ctrl modifier. Same in
     reverse when we ungrab.
 
-    Only modifiers and Esc are waited on -- see STICKY_KEYS for why the full
-    keyboard would be the wrong thing to check on a folded-back laptop.
+    The wait checks modifiers and keys consumed by a shortcut or PIN
+    submission, since unrelated held keys need not delay an unlock.
     """
     deadline = time.monotonic() + timeout
     while True:
-        held = held_sticky_keys(fds)
+        held = held_sticky_keys(fds, keys)
         if not held:
             return True
         if time.monotonic() >= deadline:
@@ -623,13 +672,14 @@ def wait_for_sticky_keys_released(fds, timeout=2.0):
         time.sleep(0.02)
 
 
-def set_grab(fd, name, grab):
+def set_grab(fd, name, grab, quiet=False):
     try:
         fcntl.ioctl(fd, EVIOCGRAB, 1 if grab else 0)
         return True
     except OSError as exc:
-        verb = "grab" if grab else "release"
-        log(f"failed to {verb} {name}: {exc}")
+        if not quiet:
+            verb = "grab" if grab else "release"
+            log(f"failed to {verb} {name}: {exc}")
         return False
 
 
@@ -650,6 +700,109 @@ def clear_state():
     except OSError as exc:
         if exc.errno != errno.ENOENT:
             log(f"could not remove {STATE_PATH}: {exc}")
+
+
+def atomic_write(path, content, mode, durable=False):
+    """Replace a runtime/config file without exposing a partially written value."""
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                     dir=os.path.dirname(path), delete=False) as handle:
+        temp_path = handle.name
+        try:
+            handle.write(content)
+            os.fchmod(handle.fileno(), mode)
+            if durable:
+                handle.flush()
+                os.fsync(handle.fileno())
+            handle.close()
+            os.replace(temp_path, path)
+        finally:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+
+
+def write_auth_state(state):
+    try:
+        atomic_write(AUTH_PATH, state + "\n", 0o644)
+        return True
+    except OSError as exc:
+        log(f"could not write {AUTH_PATH}: {exc}")
+        return False
+
+
+def clear_auth_state():
+    try:
+        os.unlink(AUTH_PATH)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log(f"could not remove {AUTH_PATH}: {exc}")
+
+
+def valid_pin(pin):
+    return 4 <= len(pin) <= MAX_PIN_DIGITS and pin.isascii() and pin.isdecimal()
+
+
+def hash_pin(pin, salt):
+    return hashlib.pbkdf2_hmac("sha256", pin.encode("ascii"), salt, PIN_ITERATIONS)
+
+
+def read_pin(path=PIN_PATH, owner=0):
+    """Return the salt and hash from a readable, private PIN file."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, encoding="ascii") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != owner or info.st_mode & 0o077:
+                return None
+            parts = handle.read(192)
+        if len(parts) == 192:
+            return None
+        parts = parts.split()
+        if len(parts) != 3 or parts[0] != "pbkdf2-sha256":
+            return None
+        salt, digest = bytes.fromhex(parts[1]), bytes.fromhex(parts[2])
+        if len(salt) == PIN_SALT_BYTES and len(digest) == PIN_HASH_BYTES:
+            return salt, digest
+    except (OSError, UnicodeError, ValueError):
+        pass
+    return None
+
+
+def set_pin(path=PIN_PATH):
+    if not sys.stdin.isatty():
+        log("--set-pin requires an interactive terminal")
+        return 1
+    if os.geteuid() != 0:
+        log("--set-pin must run as root")
+        return 1
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            pin = getpass.getpass("New Input Lock X PIN (4–12 digits): ")
+            if not valid_pin(pin):
+                log("Choose a PIN with 4–12 ASCII digits")
+                return 1
+            if pin != getpass.getpass("Repeat Input Lock X PIN: "):
+                log("The PINs did not match")
+                return 1
+        salt = os.urandom(PIN_SALT_BYTES)
+        digest = hash_pin(pin, salt)
+        atomic_write(path, f"pbkdf2-sha256 {salt.hex()} {digest.hex()}\n", 0o600, durable=True)
+    except getpass.GetPassWarning:
+        log("The terminal could not read a PIN without echoing it")
+        return 1
+    except (EOFError, KeyboardInterrupt):
+        log("PIN setup cancelled")
+        return 1
+    except OSError as exc:
+        log(f"could not save the PIN: {exc}")
+        return 1
+
+    print("Input Lock X PIN saved")
+    return 0
 
 
 def list_devices(config):
@@ -682,10 +835,10 @@ def list_devices(config):
 
     routes = escape_routes(decisions)
     if routes:
-        print("Ways back without the keyboard: " + ", ".join(routes))
+        print("Live input during the lock: " + ", ".join(routes))
     else:
         print("WARNING: nothing usable would stay live. The only ways back "
-              "would be\n         Ctrl+Esc and SSH from another machine.")
+              "would be\n         Ctrl+A+Esc and SSH from another machine.")
 
     if denied:
         print(f"\n{denied} device(s) could not be opened -- run this as root.")
@@ -693,205 +846,291 @@ def list_devices(config):
 
 
 class Locker:
-    def __init__(self, devices, max_lock_seconds):
+    def __init__(self, devices, config, pin, decisions):
         self._devices = devices
-        self._max_lock_seconds = max_lock_seconds
+        self._config = config
+        self._pin_salt, self._pin_hash = pin
         self._grabbed = []
-        self._ctrl_down = set()
+        self._known_nodes = {info.path: info.identity for info, _, _ in decisions}
+        self._hotplug_retries = {}
+        self._recovery_fds = {info.fd for info, grab, _ in decisions
+                              if grab and can_recover(info)}
+        self._keys_down = {}
+        self._resync = set()
+        self._pin_fd = None
+        self._digits = ""
+        self._prompt_deadline = None
+        self._retry_at = None
         self._running = True
+        self.force_release = False
 
     @property
     def _fds(self):
         return [fd for _, _, fd in self._devices]
 
-    def stop(self, signum=None, _frame=None):
-        if signum is not None:
-            log(f"received signal {signum}, releasing")
+    def stop(self, _signum=None, _frame=None):
         self._running = False
 
-    def grab_all(self):
-        wait_for_sticky_keys_released(self._fds)
-        for path, name, fd in self._devices:
-            if set_grab(fd, name, True):
-                self._grabbed.append((path, name, fd))
-                log(f"grabbed {path} ({name})")
-        # All or nothing. A partial grab is the worst outcome available: every
-        # consumer reports "locked" and the icon turns red while the device
-        # that failed -- quite possibly the keyboard -- keeps typing, which is
-        # exactly the accidental input this tool exists to stop.
-        if len(self._grabbed) != len(self._devices):
-            held = {fd for _, _, fd in self._grabbed}
-            for _, name, fd in self._devices:
-                if fd not in held:
-                    log(f"could not grab {name}; refusing a partial lock")
-            self.release_all()
+    def _add_grab(self, entry, quiet=False):
+        path, name, fd = entry
+        if not set_grab(fd, name, True, quiet):
             return False
-
-        self._discard_backlog()
-        self._seed_modifier_state()
+        self._grabbed.append(entry)
+        self._discard_backlog(fd)
+        self._seed_key_state(fd)
+        log(f"grabbed {path} ({name})")
         return True
 
-    def _discard_backlog(self):
-        """Throw away everything queued between open() and the grab.
+    def grab_all(self):
+        if not self._recovery_fds:
+            log("no selected keyboard supports Ctrl+A+Esc; refusing to lock")
+            return False
+        wait_for_sticky_keys_released(self._fds)
+        for entry in self._devices:
+            if not self._running or not self._add_grab(entry):
+                self.release_all()
+                return False
+        return True
 
-        evdev fills the queue from open() onward, whether or not we hold the
-        grab, and we may have sat in wait_for_sticky_keys_released() for two
-        seconds first. Those events already reached the compositor; replaying
-        them through _handle_key() would be wrong, and actively dangerous --
-        an Esc that the table pressed during the wait, or an impatient second
-        Ctrl+Esc, would unlock again milliseconds after locking.
-        """
-        discarded = 0
-        for _, _, fd in self._devices:
-            while True:
-                try:
-                    data = os.read(fd, EVENT_SIZE * 64)
-                except OSError:
+    def _discard_backlog(self, fd):
+        # Events already passed to the compositor must not trigger a chord
+        # after locking. Bound the drain so a noisy device cannot delay others.
+        for _ in range(16):
+            try:
+                if len(os.read(fd, EVENT_SIZE * 64)) < EVENT_SIZE * 64:
                     break
-                if not data:
-                    break
-                discarded += len(data) // EVENT_SIZE
-        if discarded:
-            log(f"discarded {discarded} event(s) queued before the grab")
+            except OSError:
+                break
 
-    def _seed_modifier_state(self):
-        """Record Ctrl keys that were already held when we grabbed.
+    def _seed_key_state(self, fd):
+        bitmap = read_key_bitmap(fd)
+        self._keys_down[fd] = {code for code in CHORD_KEYS if bit_is_set(bitmap, code)}
 
-        The wait above can time out -- someone holding Ctrl, or a folded
-        keyboard pressing one against the table. Without seeding, _ctrl_down
-        would start empty and the very next Esc would not be recognised as
-        Ctrl+Esc, breaking the escape hatch until the user released and
-        re-pressed Ctrl.
-        """
-        held = held_sticky_keys(self._fds)
-        self._ctrl_down = {code for code in CTRL_KEYS if code in held}
-        if self._ctrl_down:
-            log(f"ctrl already held at grab time: {sorted(self._ctrl_down)}")
+    def _dismiss_prompt(self):
+        self._pin_fd = None
+        self._digits = ""
+        self._prompt_deadline = None
+        clear_auth_state()
+
+    def _publish_prompt(self, state):
+        if not write_auth_state(state):
+            self._dismiss_prompt()
+
+    def _begin_prompt(self, fd):
+        self._pin_fd = fd
+        self._digits = ""
+        self._prompt_deadline = time.monotonic() + PIN_IDLE_SECONDS
+        self._publish_prompt("wrong" if self._retry_at is not None else "enter:0")
+
+    def _handle_key(self, fd, code, value):
+        keys = self._keys_down[fd]
+        if code in CHORD_KEYS:
+            if value == 0:
+                keys.discard(code)
+            else:
+                keys.add(code)
+        if value != 1:
+            return DRAIN_OK
+
+        if code == KEY_ESC and keys & CTRL_KEYS:
+            if KEY_A in keys:
+                return DRAIN_FORCE_RELEASE
+            if not keys & OTHER_MODIFIERS and self._pin_fd is None:
+                self._begin_prompt(fd)
+            return DRAIN_OK
+
+        if fd != self._pin_fd:
+            return DRAIN_OK
+        if code == KEY_ESC:
+            self._dismiss_prompt()
+            return DRAIN_OK
+        if self._retry_at is not None or keys & (CTRL_KEYS | OTHER_MODIFIERS):
+            return DRAIN_OK
+
+        if code in (KEY_ENTER, KEY_KPENTER):
+            if valid_pin(self._digits):
+                candidate = hash_pin(self._digits, self._pin_salt)
+                if hmac.compare_digest(candidate, self._pin_hash):
+                    return DRAIN_RELEASE
+            self._digits = ""
+            self._retry_at = time.monotonic() + PIN_RETRY_SECONDS
+            self._prompt_deadline = self._retry_at + PIN_IDLE_SECONDS
+            self._publish_prompt("wrong")
+            return DRAIN_OK
+        if code == KEY_BACKSPACE:
+            self._digits = self._digits[:-1]
+        elif code in DIGIT_KEYS and len(self._digits) < MAX_PIN_DIGITS:
+            self._digits += DIGIT_KEYS[code]
+        else:
+            return DRAIN_OK
+
+        self._prompt_deadline = time.monotonic() + PIN_IDLE_SECONDS
+        self._publish_prompt(f"enter:{len(self._digits)}")
+        return DRAIN_OK
+
+    def _drain(self, fd):
+        """Read one batch so other devices and deadlines get a turn."""
+        try:
+            data = os.read(fd, EVENT_SIZE * 64)
+        except BlockingIOError:
+            return DRAIN_OK
+        except OSError as exc:
+            log(f"read error on fd {fd}: {exc}")
+            return DRAIN_DEAD
+        if not data:
+            return DRAIN_DEAD
+
+        for _, _, etype, code, value in EVENT_STRUCT.iter_unpack(data):
+            if etype == EV_SYN and code == SYN_DROPPED:
+                self._resync.add(fd)
+                if fd == self._pin_fd:
+                    self._dismiss_prompt()
+            elif fd in self._resync:
+                if etype == EV_SYN and code == SYN_REPORT:
+                    self._resync.remove(fd)
+                    self._seed_key_state(fd)
+            elif etype == EV_KEY:
+                outcome = self._handle_key(fd, code, value)
+                if outcome != DRAIN_OK:
+                    return outcome
+        return DRAIN_OK
 
     def release_all(self):
-        # Wait for a clean keyboard first so the compositor is not handed
-        # release events for keys it never saw pressed.
-        wait_for_sticky_keys_released(self._fds, timeout=1.0)
+        # The emergency shortcut explicitly skips the key-up delay.
+        if self._grabbed and not self.force_release:
+            wait_for_sticky_keys_released(
+                self._fds, timeout=0.25, keys=STICKY_KEYS + (KEY_ENTER, KEY_KPENTER)
+            )
         for path, name, fd in self._grabbed:
             if set_grab(fd, name, False):
                 log(f"released {path} ({name})")
-        self._grabbed = []
+        self._grabbed.clear()
 
-    def _drop_device(self, dead_fd):
-        """Forget a device that has gone away.
+    def _drop_device(self, fd):
+        entry = next(entry for entry in self._devices if entry[2] == fd)
+        self._devices.remove(entry)
+        self._grabbed.remove(entry)
+        self._keys_down.pop(fd, None)
+        self._resync.discard(fd)
+        self._known_nodes.pop(entry[0], None)
+        was_recovery = fd in self._recovery_fds
+        self._recovery_fds.discard(fd)
+        if fd == self._pin_fd:
+            self._dismiss_prompt()
+        os.close(fd)
+        log(f"device disconnected: {entry[1]}")
+        if not self._grabbed or (was_recovery and not self._recovery_fds):
+            log("no grabbed input or recovery keyboard remains; releasing the lock")
+            self.stop()
 
-        Close its fd and drop the entry from both _devices and _grabbed. The
-        _grabbed removal is the load-bearing one: main()'s finally calls
-        release_all(), which set_grab()s every remaining entry, and a closed fd
-        there means a spurious "[Errno 9] Bad file descriptor" on every
-        device-disappeared shutdown.
-
-        Not about select(): the one caller returns immediately afterwards, so
-        the loop is never re-entered.
-        """
-        for entry in list(self._devices):
-            path, name, fd = entry
-            if fd != dead_fd:
-                continue
-            log(f"device disappeared, dropping {path} ({name})")
-            self._devices.remove(entry)
-            if entry in self._grabbed:
-                self._grabbed.remove(entry)
+    def _scan_new_devices(self, poller):
+        current_nodes = {}
+        retry_nodes = {}
+        for path in glob.glob(INPUT_GLOB):
             try:
-                os.close(fd)
+                identity = device_identity(os.stat(path))
             except OSError:
-                pass
+                continue
+            if self._known_nodes.get(path) == identity:
+                current_nodes[path] = identity
+                continue
 
-    def _handle_key(self, code, value):
-        """Return True if the release combo was pressed."""
-        if code in CTRL_KEYS:
-            # value 0 = up, 1 = down, 2 = autorepeat. Tracked per key so that
-            # releasing one Ctrl while the other is held does not clear it.
-            if value == 0:
-                self._ctrl_down.discard(code)
-            else:
-                self._ctrl_down.add(code)
-        elif code == KEY_ESC and value == 1 and self._ctrl_down:
-            log("Ctrl+Esc detected, unlocking")
-            return True
-        return False
-
-    def _drain(self, fd):
-        """Read and interpret all pending events on one device.
-
-        Returns DRAIN_RELEASE if the unlock combo was seen, DRAIN_DEAD if the
-        device is gone, DRAIN_OK otherwise.
-        """
-        while True:
+            retry = self._hotplug_retries.get(path) == identity
             try:
-                data = os.read(fd, EVENT_SIZE * 64)
-            except BlockingIOError:
-                return DRAIN_OK
+                info = open_device(path)
             except OSError as exc:
-                # Anything other than "nothing to read" means this device is
-                # not coming back -- typically an i2c-HID touchpad re-probed
-                # across suspend. Returning OK here would leave a permanently
-                # readable fd in the select set and spin the loop at 100% CPU.
-                log(f"read error on fd {fd}: {exc}")
-                return DRAIN_DEAD
-            if not data:
-                return DRAIN_OK
+                if exc.errno not in (errno.ENOENT, errno.ENODEV):
+                    if not retry:
+                        log(f"will retry inspecting new input device {path}: {exc}")
+                    retry_nodes[path] = identity
+                continue
+            if info is None:
+                continue
 
-            for offset in range(0, len(data) - EVENT_SIZE + 1, EVENT_SIZE):
-                _, _, etype, code, value = EVENT_STRUCT.unpack_from(data, offset)
-                if etype == EV_KEY and self._handle_key(code, value):
-                    return DRAIN_RELEASE
-
-            if len(data) < EVENT_SIZE * 64:
-                return DRAIN_OK
+            grab, _ = decide(info, self._config)
+            if not grab:
+                current_nodes[path] = info.identity
+                os.close(info.fd)
+                continue
+            entry = info.path, info.name, info.fd
+            if not self._add_grab(entry, quiet=retry):
+                os.close(info.fd)
+                if not retry:
+                    log(f"will retry grabbing newly connected input: {info.name}")
+                retry_nodes[path] = info.identity
+                continue
+            current_nodes[path] = info.identity
+            self._devices.append(entry)
+            if can_recover(info):
+                self._recovery_fds.add(info.fd)
+            poller.register(info.fd, select.POLLIN)
+        self._known_nodes = current_nodes
+        self._hotplug_retries = retry_nodes
 
     def run(self):
-        deadline = (
-            time.monotonic() + self._max_lock_seconds
-            if self._max_lock_seconds > 0
-            else None
-        )
+        poller = select.poll()
+        for fd in self._fds:
+            poller.register(fd, select.POLLIN)
+        now = time.monotonic()
+        max_lock = self._config.max_lock_seconds
+        lock_deadline = now + max_lock if max_lock > 0 else None
+        next_scan = now + SCAN_SECONDS
+        interval = watchdog_interval()
+        next_ping = now if interval is not None else None
 
         while self._running:
-            timeout = 1.0
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    log(f"max_lock_seconds ({self._max_lock_seconds}) reached, unlocking")
-                    break
-                timeout = min(timeout, remaining)
+            now = time.monotonic()
+            if lock_deadline is not None and now >= lock_deadline:
+                log(f"max_lock_seconds ({max_lock}) reached, unlocking")
+                return
+            if next_ping is not None and now >= next_ping:
+                sd_notify("WATCHDOG=1")
+                next_ping = now + interval
+            if self._prompt_deadline is not None and now >= self._prompt_deadline:
+                self._dismiss_prompt()
+            if self._retry_at is not None and now >= self._retry_at:
+                self._retry_at = None
+                if self._pin_fd is not None:
+                    self._publish_prompt("enter:0")
 
-            # No InterruptedError arm: PEP 475 makes select() retry on EINTR
-            # itself, so a signal never surfaces here -- SIGTERM runs stop(),
-            # which only clears the flag, and this call keeps waiting out its
-            # timeout. Shutdown therefore lags by up to `timeout` (1.0s), well
-            # inside the unit's TimeoutStopSec=5.
+            wake_at = min(t for t in (next_scan, next_ping, lock_deadline,
+                                     self._prompt_deadline, self._retry_at)
+                          if t is not None)
             try:
-                readable, _, _ = select.select(self._fds, [], [], timeout)
+                ready = poller.poll(max(0, int((wake_at - now) * 1000 + 0.999)))
             except OSError as exc:
-                log(f"select failed: {exc}")
-                break
-
-            for fd in readable:
-                outcome = self._drain(fd)
-                if outcome == DRAIN_RELEASE:
+                log(f"poll failed: {exc}")
+                return
+            if not self._running:
+                return
+            if self._prompt_deadline is not None and time.monotonic() >= self._prompt_deadline:
+                self._dismiss_prompt()
+            for fd, events in ready:
+                outcome = DRAIN_DEAD if events & DEVICE_FAULT else self._drain(fd)
+                if outcome in (DRAIN_FORCE_RELEASE, DRAIN_RELEASE):
+                    self.force_release = outcome == DRAIN_FORCE_RELEASE
+                    log("emergency shortcut released input" if self.force_release
+                        else "PIN accepted; releasing input")
                     return
                 if outcome == DRAIN_DEAD:
+                    poller.unregister(fd)
                     self._drop_device(fd)
-                    # The same all-or-nothing rule grab_all() applies at
-                    # startup. Once a device is gone we can no longer hold a
-                    # full lock, and staying alive would keep the state file --
-                    # and the red icon -- advertising one over live input. A
-                    # touchpad re-enumerated across suspend is the likely case.
-                    # Exiting releases everything and lets the icon and the
-                    # notification tell the truth.
-                    log("a grabbed device disappeared; releasing the whole lock")
-                    return
+                    if not self._running:
+                        return
+
+            now = time.monotonic()
+            if now >= next_scan and self._running:
+                self._scan_new_devices(poller)
+                next_scan = now + SCAN_SECONDS
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument(
+    parser.add_argument("--protocol-version", action="version", version="3")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--set-pin", action="store_true", help="set the unlock PIN")
+    modes.add_argument("--pin-configured", action="store_true", help="check the PIN file")
+    modes.add_argument(
         "--list",
         action="store_true",
         help="list input devices and which ones would be grabbed, then exit",
@@ -901,10 +1140,19 @@ def main():
     )
     args = parser.parse_args()
 
-    config = read_config(args.config)
+    if args.set_pin:
+        return set_pin()
+    if args.pin_configured:
+        return 0 if read_pin() is not None else 1
 
+    config = read_config(args.config)
     if args.list:
         return list_devices(config)
+
+    pin = read_pin()
+    if pin is None:
+        log(f"no valid private PIN in {PIN_PATH}; run the daemon with --set-pin first")
+        return 1
 
     devices, denied, decisions = find_devices(config)
     if not devices:
@@ -930,12 +1178,7 @@ def main():
 
     log_safety_notes(decisions)
 
-    # Non-blocking so a partial read can never wedge the loop.
-    for _, _, fd in devices:
-        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-
-    locker = Locker(devices, config.max_lock_seconds)
+    locker = Locker(devices, config, pin, decisions)
     signal.signal(signal.SIGTERM, locker.stop)
     signal.signal(signal.SIGINT, locker.stop)
 
@@ -947,6 +1190,7 @@ def main():
                 "refusing to stay running")
             return 1
         grabbed = True
+        clear_auth_state()
 
         # The state file is the single source of truth for every consumer. A
         # grab nobody can observe is worse than no grab at all -- input-lock-x
@@ -976,13 +1220,14 @@ def main():
         # the file on the way out it would tell the world "unlocked" while the
         # real daemon still held the keyboard, and StartUnit on an
         # already-active unit would not recreate it.
-        if published:
-            clear_state()
         for _, _, fd in devices:
             try:
                 os.close(fd)
             except OSError:
                 pass
+        if published:
+            clear_state()
+            clear_auth_state()
         if grabbed:
             log("input lock ended, input restored")
 

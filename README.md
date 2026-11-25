@@ -1,26 +1,41 @@
 # Input Lock X
-<img width="1920" height="1200" alt="input-lock-x" src="https://github.com/user-attachments/assets/bea52769-1382-4caf-9dfc-00633bf47d86" />
 
-Input Lock X is an open-source GNOME Shell extension for Linux that temporarily
-disables a convertible laptop's built-in keyboard and touchpad in tablet mode.
-It uses a small companion root daemon to grab selected evdev devices while
-leaving the touchscreen available in auto mode for recovery.
+Input Lock X keeps your screen visible while it temporarily blocks your
+configured keyboard, touchpad, and mouse. It runs on GNOME Shell and keeps the
+display awake while input is locked.
 
-Use it when folding a 2-in-1 laptop into tablet mode or cleaning a touchscreen
-without accidental input. It supports GNOME Shell 45–50 on Wayland and X11.
+## When to use it
 
-- Toggle the lock from the panel.
-- Use **Ctrl+Esc** to engage or release it.
-- The touchscreen stays available in auto mode, so the panel icon remains usable.
-- Notifications show when input is disabled or enabled.
+- **Step away in a library.** Leave a lecture, video, or set of notes visible for
+  a friend while blocking clicks and keystrokes from the devices you locked.
+- **Show something without handing over the controls.** Keep a slide, demo, or
+  document visible on a shared table without people accidentally navigating away.
+- **Clean the keyboard or touchpad.** Wipe the controls while your work stays on
+  screen.
+- **Use a convertible in tablet mode.** Block the folded keyboard and touchpad
+  while using a touchscreen that remains available in auto mode.
 
-The project was written on a Chuwi Minibook X running Fedora, but device selection is based on
-evdev capabilities rather than a list of machine-specific names.
+Use [Focus Lock](https://github.com/ayushxaw/focus-lock) when someone should
+still be able to use a single app, for example to play a game while the window
+stays in focus.
 
-> **Warning:** this installs a root service and can disable every input device
-> that matches its configuration. Keep an SSH session open during the first
-> install and test. In auto mode, the touchscreen and USB/Bluetooth input are
-> left alone by default.
+## Quick reference
+
+[Install and choose your first PIN](#installation) ·
+[Change or reset your PIN](#change-or-reset-your-pin) ·
+[Emergency release](#recovery) · [Command list](HELPER.txt)
+
+### Shortcuts
+
+| Action | Shortcut |
+| --- | --- |
+| Lock configured devices | Press **Ctrl+Esc**. |
+| Unlock with your PIN | Press **Ctrl+Esc** on a locked keyboard, type your Lock X PIN on that keyboard, and press **Enter**. |
+| Dismiss the PIN prompt | Press **Esc**. Input stays locked. |
+| Emergency release | Hold **Ctrl+A**, then press **Esc** on the same locked keyboard. |
+
+Anyone who knows the emergency shortcut can release Input Lock X. Use GNOME's
+screen lock when you need to protect access to your desktop.
 
 ## Requirements
 
@@ -30,42 +45,40 @@ evdev capabilities rather than a list of machine-specific names.
 - Python 3 (standard library only)
 - `git`, `make`, and `glib-compile-schemas` for installation
 
-It has been tested on Fedora. The installer does not depend on a particular
-Linux distribution, but the service needs access to `/dev/input` and a working
-systemd/polkit setup.
+The installer supports Linux systems with access to `/dev/input` and a working
+systemd and polkit setup.
 
-The extension and daemon are both required. The extension is not currently
-published on extensions.gnome.org; install both parts from this repository.
+Install the GNOME extension and system daemon together from this repository.
 
 ## Recovery
 
 If the lock does not release normally:
 
-1. Press **Ctrl+Esc** on the locked keyboard. The daemon watches for this
-   combination itself, so it also works on the lock screen.
-2. Tap the panel icon from the touchscreen, or use an ungrabbed pointer.
-3. In auto mode, use an external keyboard if one is available.
-4. From another machine, run:
+1. On the same locked keyboard, hold **Ctrl** and **A**, then press **Esc**.
+   The daemon releases all of its input grabs, including during a PIN prompt.
+   This shortcut works without GNOME and without a PIN. Anyone who knows it
+   can release the lock.
+2. From another machine, an administrator can run the following command.
+   Replace `user@laptop` with the SSH login for your laptop.
 
    ```sh
-   ssh <this-machine> input-lock-x-emergency-unlock
+   ssh user@laptop input-lock-x-emergency-unlock
    ```
 
-5. As a last resort, kill the service. The kernel releases its input grabs when
-   the daemon exits:
+3. An administrator can also run `sudo systemctl stop input-lock-x.service`.
+   The kernel releases the input grabs if the daemon stops or crashes.
+   Systemd stops the daemon if its watchdog stops receiving updates.
 
-   ```sh
-   sudo systemctl kill -s KILL input-lock-x.service
-   ```
-
-Rebooting also restores input; the service is never enabled at boot.
-
-GNOME disables extensions on the lock screen, so the panel icon is not
-available there. **Ctrl+Esc** is the local escape route in that situation.
+The recovery shortcut releases Input Lock X. Your normal sign-in is still
+required if the GNOME lock screen is active.
 
 ## Installation
 
-Run the installer as your normal user. It uses `sudo` for system files.
+Run the installer from a terminal as your normal user while input is unlocked.
+It uses `sudo` to install a system service and asks you to choose a 4–12 digit
+Lock X PIN if you have not set one. Keep a second device with an SSH session
+open during the first install and hardware test so that you can run the
+[recovery command](#recovery) if needed.
 
 ### 1. Install prerequisites
 
@@ -84,13 +97,14 @@ Keep the checkout in a permanent location. The installer symlinks the extension
 directory to this checkout.
 
 ```sh
-git clone https://github.com/isalin/input-lock-x.git
+git clone https://github.com/ayushxaw/input-lock-x.git
 cd input-lock-x
 ```
 
 ### 3. Check device detection
 
-This reads `/proc/bus/input/devices` and does not need root or install anything:
+This reads `/proc/bus/input/devices` and checks default device selection
+without root.
 
 ```sh
 make test
@@ -124,12 +138,12 @@ gnome-extensions info input-lock-x@isalin.github.io
 input-lock-x status
 ```
 
-Then test the complete round trip from another machine:
+If you have an SSH session open, test the complete round trip:
 
 ```sh
-ssh <this-machine> input-lock-x on
-# Press Ctrl+Esc on the laptop.
-ssh <this-machine> input-lock-x-emergency-unlock  # if needed
+ssh user@laptop input-lock-x on
+# On the laptop, press Ctrl+Esc, type the PIN, and press Enter.
+ssh user@laptop input-lock-x-emergency-unlock  # if needed
 ```
 
 ### Installer options
@@ -140,8 +154,8 @@ ssh <this-machine> input-lock-x-emergency-unlock  # if needed
 --link-extension   Replace another extension install with this checkout.
 ```
 
-Use `--daemon-only` when the extension was installed separately, for example
-from extensions.gnome.org. It does not replace or enable that extension.
+Use `--daemon-only` to update the system files while keeping an existing
+extension installation.
 
 `--link-extension` is intended for development or when you explicitly want this
 checkout to replace another copy. The installer asks before deleting a foreign
@@ -150,21 +164,21 @@ extension directory or repointing another symlink.
 Without the sudoers file, use a TTY for SSH recovery:
 
 ```sh
-ssh -t <this-machine> sudo input-lock-x-emergency-unlock
+ssh -t user@laptop sudo input-lock-x-emergency-unlock
 ```
 
 ### Updating
 
-Pull the changes and run the installer again:
+With the lock released, open a terminal in your Input Lock X checkout and run:
 
 ```sh
-git -C /path/to/input-lock-x pull
-cd /path/to/input-lock-x
-./install.sh
+git pull
+make install-daemon
 ```
 
-The daemon and system files are installed as copies. The extension is a symlink,
-so do not delete or move the checkout while using it.
+The installer preserves `/etc/input-lock-x.conf` and your PIN. Sign out of
+GNOME and back in to load the updated extension code. GNOME loads that code
+through a symlink, so keep the checkout in place while using it.
 
 ### Uninstalling
 
@@ -190,8 +204,8 @@ input-lock-x toggle   # switch between the two states
 input-lock-x status   # show state and matched devices
 ```
 
-The default shortcut engages the lock. Its setting can be changed in
-**Extensions → Input Lock X → Settings**, or with:
+The default shortcut engages the lock. To change the shortcut that engages
+the lock, use **Extensions → Input Lock X → Settings** or run:
 
 ```sh
 gsettings --schemadir \
@@ -199,8 +213,25 @@ gsettings --schemadir \
   set org.gnome.shell.extensions.input-lock-x toggle-hid "['<Control>Escape']"
 ```
 
-The daemon's release shortcut is always **Ctrl+Esc** and cannot be rebound.
-This is intentional: the escape route should not be possible to configure away.
+On a grabbed keyboard, **Ctrl+Esc** always opens the PIN prompt. Type the PIN
+on that keyboard and press **Enter**. Use **Backspace** to correct digits or
+**Esc** to dismiss the prompt. A wrong PIN, a cancelled prompt, or a prompt
+timeout leaves input locked.
+
+## Change or reset your PIN
+
+While input is unlocked, open Terminal and run:
+
+```sh
+sudo /usr/local/bin/input-lock-x-daemon --set-pin
+```
+
+If `sudo` asks for a password, enter your Linux account password first.
+Then choose a separate 4–12 digit Lock X PIN and enter it twice. The new PIN
+takes effect the next time you lock. Lock X stores a salted hash on your machine.
+
+If you forget your PIN, hold **Ctrl+A** and press **Esc** on the locked
+keyboard to release input, then run the same command to set a new PIN.
 
 ## Device selection
 
@@ -215,9 +246,10 @@ Auto mode examines every `/dev/input/event*` device:
 | Virtual/uinput device | Never grabbed |
 | Other devices | Skipped |
 
-The classifier uses evdev capabilities and input properties. It does not depend
-on vendor names. USB and Bluetooth devices can be included when an internal
-keyboard uses one of those buses.
+The daemon uses Linux evdev capabilities and input properties to select
+devices. Enable `include_usb` or `include_bluetooth` to lock matching external
+keyboards and pointing devices. A matching device connected during a lock can
+briefly accept input before the next scan.
 
 ### Configuration
 
@@ -255,7 +287,7 @@ service can open the devices.
 
 ## Permissions and security
 
-The polkit rule allows members of `wheel`, `sudo`, or `admin` to start and stop
+The polkit rule allows members of `wheel`, `sudo`, or `admin` to start
 this service from an active local session. By default, the installer also adds
 `/etc/sudoers.d/input-lock-x`, allowing those groups to run only the two
 installed control scripts without a password. This makes non-interactive SSH
@@ -274,9 +306,8 @@ sudo input-lock-x-daemon --list
 journalctl -u input-lock-x.service -b
 ```
 
-**Yellow warning icon:** the extension cannot find
-`input-lock-x.service`. Install the daemon with `./install.sh` or
-`./install.sh --daemon-only`.
+**The shortcut reports that the daemon needs an update:** run
+`./install.sh --daemon-only` from a regular terminal.
 
 **The panel button or shortcut is denied:** check that the polkit rule exists
 and that your user is in `wheel`, `sudo`, or `admin`:
@@ -310,9 +341,7 @@ The GitHub Actions workflow runs `make check` and `make test` on pushes and pull
 requests. `shellcheck` and `node` are optional for a local `make check`, but CI
 requires them.
 
-See [CHANGELOG.md](CHANGELOG.md) for the release history and
-[GitHub Releases](https://github.com/isalin/input-lock-x/releases) for packaged
-versions.
+See [CHANGELOG.md](CHANGELOG.md) for the inherited release history.
 
 The main components are:
 
@@ -324,7 +353,11 @@ The main components are:
 | `lib/` | Installer and uninstaller helpers |
 | `tests/` | Offline unit tests and device classifier |
 
-## License
+## Credits and license
+
+Isak Lindgren developed Input Lock X for the Chuwi Minibook X. Ayush (ayushxaw)
+adapted it on 2026-11-25 with PIN unlock, automatic keep-awake, and a separate
+emergency shortcut. [Upstream Input Lock X](https://github.com/isalin/input-lock-x)
 
 Copyright (C) 2026 Isak Lindgren.
 

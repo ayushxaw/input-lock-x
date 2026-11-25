@@ -9,6 +9,8 @@
 # Usage: ./uninstall.sh
 #   No options. -h/--help prints this and does nothing else.
 
+# PIN configuration cleanup guidance by ayushxaw, 2026-11-25.
+
 set -euo pipefail
 
 # pwd -P, not pwd: bash's pwd is logical, so a checkout reached through a
@@ -156,6 +158,6 @@ cat <<EOF
 == Uninstalled.
 
 Config files were left in place in case you edited them:
-    sudo rm -f "$CONF" "$LEGACY_CONF"
+    sudo rm -f "$CONF" "$PIN_CONF" "$LEGACY_CONF"
 
 EOF

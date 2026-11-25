@@ -1,6 +1,7 @@
 #!/bin/sh
 # Copyright (C) 2026 Isak Lindgren
 # SPDX-License-Identifier: GPL-2.0-or-later
+# Recovery process matching and PIN state cleanup by ayushxaw, 2026-11-25.
 # Unconditionally restore keyboard and touchpad input.
 #
 # This is the "I am locked out, SSH in and fix it" button. It is idempotent,
@@ -13,36 +14,24 @@ set -u
 
 UNIT="input-lock-x.service"
 STATE="/run/input-lock-x.state"
-# Anchored on the full install path, so an editor with the source file open or
-# a `journalctl ... input-lock-x-daemon` is not mistaken for the daemon. Telling a
-# locked-out user "STILL RUNNING -- something is very wrong" when input is
-# actually fine is the worst possible lie.
+AUTH_STATE="/run/input-lock-x.auth"
 DAEMON='/usr/local/bin/input-lock-x-daemon'
 
-# The path alone is not enough: `input-lock-x status` runs the very same binary
-# with --list. Killing that, or counting it as a stuck daemon, would make this
-# script report a failed recovery -- which now also aborts uninstall.sh. Only
-# instances that can actually hold a grab count. Scan /proc directly rather
-# than depending on pgrep: procps is not guaranteed by the minimal dependency
-# set, and an absent pgrep must not turn an orphaned grab into a false success.
+# Match the daemon as a Python script argument, using the original NUL
+# separators. A terminal or editor that mentions its path is a different
+# process, and status, PIN setup and help cannot hold a grab.
 daemon_pids() {
     for dir in /proc/[0-9]*; do
-        p=${dir#/proc/}
-        [ "$p" = "$$" ] && continue
-        # The process can exit between the glob and the read, and kernel
-        # threads have no cmdline at all. Either way, not a daemon.
-        [ -r "$dir/cmdline" ] || continue
-        # Put stderr on /dev/null before the input redirect: if the process
-        # disappears between the checks, the shell's failed redirect is quiet.
-        cmdline="$(tr '\0' ' ' 2>/dev/null <"$dir/cmdline")" || continue
-        case "$cmdline" in
-            *"$DAEMON"*) ;;
-            *) continue ;;
-        esac
-        case "$cmdline" in
-            *--list*) continue ;;
-        esac
-        printf '%s\n' "$p"
+        [ -O "$dir" ] && [ -r "$dir/cmdline" ] || continue
+        if /usr/bin/awk -v daemon="$DAEMON" '
+            BEGIN { RS = "\0" }
+            NR == 1 { python = $0 ~ /(^|\/)python3([.][0-9]+)?$/ }
+            NR == 2 { script = $0 == daemon }
+            NR > 2 && /^(-h|--help|--list|--protocol-version|--pin-configured|--set-pin)$/ { skip = 1 }
+            END { exit !(python && script && !skip) }
+        ' 2>/dev/null <"$dir/cmdline"; then
+            printf '%s\n' "${dir#/proc/}"
+        fi
     done
 
     # Callers assign this in a command substitution under `set -e`; a scan
@@ -114,7 +103,7 @@ for f in /sys/class/input/input*/inhibited; do
 done
 
 echo "-- removing ${STATE}"
-rm -f "$STATE"
+rm -f "$STATE" "$AUTH_STATE"
 
 echo
 echo "== Result =="

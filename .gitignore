@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 extension/schemas/gschemas.compiled
 build/
+
+# Local files and rollback copies
+/input-lock-x.pin
+/unlock-pin.txt
+*.before-password-gate-*

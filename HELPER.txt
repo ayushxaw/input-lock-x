@@ -1,0 +1,63 @@
+INPUT LOCK X HELPER
+===================
+
+LOCK OR UNLOCK
+--------------
+Press Ctrl+Esc to lock the keyboard and mouse and keep the display awake.
+To unlock, press Ctrl+Esc on the locked keyboard, type your Lock X PIN on
+that same keyboard, and press Enter. Esc alone dismisses the PIN prompt.
+
+EMERGENCY RELEASE
+-----------------
+On the same locked keyboard, hold Ctrl and A, then press Esc.
+This immediately releases Input Lock X without a PIN. Anyone who knows
+the shortcut can use it. Ubuntu's own sign-in password still applies
+if the Ubuntu lock screen is active.
+
+If you can reach a Terminal, try this release command first:
+
+input-lock-x off
+
+If it fails, run:
+
+input-lock-x-emergency-unlock
+
+If SSH is already set up, you can run either command in an SSH session
+connected to this laptop.
+
+CHANGE THE LOCK X PIN
+---------------------
+While Lock X is unlocked, open Terminal and paste this line:
+
+sudo /usr/local/bin/input-lock-x-daemon --set-pin
+
+If sudo asks for your password, enter your Ubuntu password first.
+Then enter your new 4–12 digit Lock X PIN twice. The new PIN takes
+effect the next time you engage the lock.
+
+INSTALL OR UPDATE
+-----------------
+While Lock X is unlocked, open Terminal in this project folder and run:
+
+make install-daemon
+
+If prompted, create a Lock X PIN. Save your work, then sign out of Ubuntu
+and back in to load the updated extension.
+
+TERMINAL COMMANDS
+-----------------
+Check whether Input Lock X is engaged:
+
+input-lock-x status
+
+Engage the lock from Terminal:
+
+input-lock-x on
+
+Release the lock from an administrator Terminal:
+
+input-lock-x off
+
+Read recent service logs if the shortcut fails:
+
+journalctl -u input-lock-x.service -b -n 30 --no-pager

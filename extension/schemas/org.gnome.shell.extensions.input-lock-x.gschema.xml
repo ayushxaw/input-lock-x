@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Copyright (C) 2026 Isak Lindgren
-     SPDX-License-Identifier: GPL-2.0-or-later -->
+     SPDX-License-Identifier: GPL-2.0-or-later
+     PIN and recovery instructions updated by ayushxaw, 2026-11-25. -->
 <schemalist>
   <schema id="org.gnome.shell.extensions.input-lock-x"
           path="/org/gnome/shell/extensions/input-lock-x/">
@@ -12,12 +13,9 @@
       <default><![CDATA[['<Control>Escape']]]></default>
       <summary>Engage the keyboard and touchpad lock</summary>
       <description>
-        Shortcut that engages the lock. It does not release it: once the lock
-        is on, the daemon holds an exclusive grab and the shell never sees the
-        keyboard at all, so no shell keybinding can fire. The daemon watches
-        its own grabbed stream for Ctrl+Esc and releases on that. Ctrl+Esc is
-        fixed and not configurable, deliberately -- it is the escape hatch, and
-        a rebindable escape hatch can be rebound into a lockout.
+        Shortcut that engages the lock from GNOME. On an already locked
+        keyboard, the daemon uses Ctrl+Esc to open the PIN prompt and
+        Ctrl+A+Esc to release input in an emergency.
       </description>
     </key>
 

@@ -1,6 +1,7 @@
 /* Input Lock X -- preferences
  * Copyright (C) 2026 Isak Lindgren
  * SPDX-License-Identifier: GPL-2.0-or-later
+ * PIN and recovery shortcut instructions by ayushxaw, 2026-11-25.
  *
  * Two things a user cannot discover from the panel button: what the shortcut
  * is bound to, and whether the root daemon this extension drives is actually
@@ -75,10 +76,7 @@ export default class InputLockXPreferences extends ExtensionPreferences {
 
     _shortcutGroup(window, settings) {
         const group = new Adw.PreferencesGroup({
-            title: 'Shortcut',
-            description: 'Engages the lock. While the lock is on the daemon ' +
-                'holds the internal keyboard exclusively, so this shortcut ' +
-                'only reaches the shell again from a device it did not grab.',
+            title: 'Shortcuts',
         });
 
         const label = new Gtk.ShortcutLabel({
@@ -100,7 +98,7 @@ export default class InputLockXPreferences extends ExtensionPreferences {
         });
 
         const row = new Adw.ActionRow({
-            title: 'Toggle the input lock',
+            title: 'Engage Input Lock X',
             activatable: true,
         });
         row.add_suffix(label);
@@ -117,16 +115,13 @@ export default class InputLockXPreferences extends ExtensionPreferences {
         row.connect('activated', () => this._captureShortcut(window, settings));
         group.add(row);
 
-        // Stated here rather than only in the README, because this screen is
-        // where someone rebinds -- and the moment just after is exactly when
-        // believing the new keys also release would leave them holding a dead
-        // keyboard, looking for a combination nothing has told them about.
         group.add(new Adw.ActionRow({
-            title: 'Release is always Ctrl+Esc',
-            subtitle: 'Fixed in the daemon and unaffected by the shortcut ' +
-                'above. It is watched for inside the grab, so it releases the ' +
-                'lock from the locked keyboard itself — and on the lock ' +
-                'screen, where extensions are disabled.',
+            title: 'Unlock with Ctrl+Esc',
+            subtitle: 'On a locked keyboard, enter your Lock X PIN and press Enter.',
+        }));
+        group.add(new Adw.ActionRow({
+            title: 'Emergency release with Ctrl+A+Esc',
+            subtitle: 'Hold Ctrl and A on the same locked keyboard, then press Esc.',
         }));
 
         return group;
@@ -217,7 +212,7 @@ export default class InputLockXPreferences extends ExtensionPreferences {
             title: 'Daemon',
             description: 'The lock itself is done by a small root service. A ' +
                 'GNOME extension cannot open /dev/input, so it is installed ' +
-                'separately; this extension only starts and stops it.',
+                'separately. This extension starts it and displays the PIN prompt.',
         });
 
         const status = new Adw.ActionRow({
@@ -238,8 +233,7 @@ export default class InputLockXPreferences extends ExtensionPreferences {
                 return;
             }
             if (state === null) {
-                status.subtitle = 'Not installed — the panel button cannot ' +
-                    'lock anything until it is.';
+                status.subtitle = 'Install the Input Lock X daemon to use the shortcut.';
                 icon.icon_name = 'dialog-warning-symbolic';
                 return;
             }

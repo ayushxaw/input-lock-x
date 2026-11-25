@@ -1,11 +1,12 @@
 /* Input Lock X
  * Copyright (C) 2026 Isak Lindgren
  * SPDX-License-Identifier: GPL-2.0-or-later
+ * PIN prompt and keep-awake behavior by ayushxaw, 2026-11-25.
  *
- * Adds a panel button and a Ctrl+Esc shortcut that lock the internal keyboard
- * and touchpad. The actual locking is done by input-lock-x.service, a root
- * daemon that takes an exclusive EVIOCGRAB on those devices; this extension
- * only starts and stops that unit over systemd's D-Bus API.
+ * Locks the internal keyboard and touchpad using input-lock-x.service,
+ * a root daemon that takes an exclusive EVIOCGRAB on those devices. The
+ * extension starts the service and displays PIN progress reported by the
+ * daemon. The daemon owns keyboard input and the release decision.
  *
  * The daemon's state file is the single source of truth for the UI. We never
  * assume we know the state -- the daemon can release itself when it sees
@@ -25,6 +26,8 @@ import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
 
+import * as Dialog from 'resource:///org/gnome/shell/ui/dialog.js';
+import * as ModalDialog from 'resource:///org/gnome/shell/ui/modalDialog.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -34,6 +37,7 @@ import {
     SYSTEMD_NAME, SYSTEMD_PATH, SYSTEMD_MANAGER,
     probeUnit, isAuthDenied, AUTH_DENIED_HINT,
 } from './common.js';
+import {KeepAwake} from './keepAwake.js';
 
 // The file monitor is the primary signal; this is a cheap backstop in case an
 // inotify event is ever missed and the icon is left showing the wrong state.
@@ -54,6 +58,10 @@ const SETTLE_ATTEMPTS = 20;
 const ICON_UNLOCKED = 'input-keyboard-symbolic';
 const ICON_LOCKED = 'changes-prevent-symbolic';
 const ICON_MISSING = 'dialog-warning-symbolic';
+const DAEMON_PATH = '/usr/local/bin/input-lock-x-daemon';
+const DAEMON_PROTOCOL = '3';
+const PROMPT_PATH = '/run/input-lock-x.auth';
+const PIN_MAX_DIGITS = 12;
 
 const InputLockButton = GObject.registerClass(
 class InputLockButton extends PanelMenu.Button {
@@ -74,15 +82,8 @@ class InputLockButton extends PanelMenu.Button {
         this.add_style_class_name('input-lock-x-toggle');
     }
 
-    /* Handle touch as well as pointer: in tablet mode the touchscreen is the
-     * only working input device, and it is the way back from a locked state.
-     * Touch is unconditional -- it has no button to check.
-     *
-     * Pointer presses are restricted to the primary button. PanelMenu.Button
-     * toggles on any button, but that opens a menu; this disables the keyboard
-     * and touchpad, so a stray right- or middle-click should not do it. Nothing
-     * else would absorb them either: the button is built with dontCreateMenu,
-     * which leaves the base gesture disabled and this.menu a PopupDummyMenu. */
+    // Show the recovery instructions from an available pointer or touchscreen.
+    // A middle or right click leaves the status indicator alone.
     vfunc_event(event) {
         const type = event.type();
         if (type === Clutter.EventType.TOUCH_BEGIN ||
@@ -96,6 +97,7 @@ class InputLockButton extends PanelMenu.Button {
 
     setLocked(locked) {
         this._locked = locked;
+        this.container.visible = locked;
         this._update();
     }
 
@@ -125,7 +127,7 @@ class InputLockButton extends PanelMenu.Button {
             this.remove_style_class_name('input-lock-x-locked');
 
         this.accessible_name = this._locked
-            ? 'Keyboard and touchpad disabled'
+            ? 'Input Lock X: unlock instructions'
             : 'Keyboard and touchpad enabled';
     }
 });
@@ -153,17 +155,25 @@ export default class InputLockXExtension extends Extension {
     }
 
     _setUp() {
+        this._stateFile = Gio.File.new_for_path(STATE_PATH);
+        this._promptFile = Gio.File.new_for_path(PROMPT_PATH);
         this._locked = this._readState();
         // Assume installed until the probe says otherwise, so a slow bus does
         // not flash a warning icon on every login.
         this._installed = true;
-        this._pending = false;
+        this._pending = null;
         this._pendingId = 0;
+        this._compatible = null;
+        this._probeGeneration = 0;
+        this._versionProcess = null;
+        this._promptDialog = null;
+        this._promptStatus = null;
         this._keybindingWanted = false;
         this._keybindingAdded = false;
         this._pollTick = 0;
         this._reloadId = 0;
         this._cancellable = new Gio.Cancellable();
+        this._keepAwake = new KeepAwake();
 
         this._settings = this.getSettings();
         // _installed is still optimistically true here, so a normal install
@@ -171,10 +181,21 @@ export default class InputLockXExtension extends Extension {
         // the daemon turns out to be missing.
         this._syncKeybinding();
 
-        this._monitor = Gio.File.new_for_path(STATE_PATH)
-            .monitor_file(Gio.FileMonitorFlags.WATCH_MOVES, null);
-        this._monitorId = this._monitor.connect('changed',
-            () => this._refresh());
+        // The daemon replaces the PIN marker atomically on each keystroke.
+        // Watch its directory so the monitor follows replacements immediately.
+        try {
+            this._monitor = this._stateFile.get_parent()
+                .monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, null);
+            this._monitor.rate_limit = 0;
+            this._monitorId = this._monitor.connect('changed', (_monitor, file, otherFile) => {
+                if (file.equal(this._stateFile) || file.equal(this._promptFile) ||
+                    otherFile?.equal(this._stateFile) || otherFile?.equal(this._promptFile)) {
+                    this._refresh();
+                }
+            });
+        } catch (error) {
+            console.warn(`[input-lock-x] Could not monitor input state: ${error.message}`);
+        }
 
         // Both install.sh and uninstall.sh end in daemon-reload, and that is
         // the only way the unit can appear or disappear underneath a running
@@ -186,19 +207,25 @@ export default class InputLockXExtension extends Extension {
             null, Gio.DBusSignalFlags.NONE,
             (_conn, _sender, _path, _iface, _signal, params) => {
                 const [active] = params.deepUnpack();
-                if (!active)
+                if (active) {
+                    this._compatible = null;
+                    ++this._probeGeneration;
+                } else {
                     this._probeInstall();
+                }
             });
 
+        const pollInterval = this._monitorId ? POLL_INTERVAL_SECONDS : 2;
         this._pollId = GLib.timeout_add_seconds(
-            GLib.PRIORITY_DEFAULT_IDLE, POLL_INTERVAL_SECONDS, () => {
+            GLib.PRIORITY_DEFAULT_IDLE, pollInterval, () => {
                 this._refresh();
                 // Installing the daemon after the extension is the documented
                 // path, and it does not restart the shell. The Reloading
                 // subscription catches that within a second; this is only the
                 // backstop for a unit file that appeared without a reload.
                 // Only while missing, so the normal case costs no bus traffic.
-                if (!this._installed && ++this._pollTick >= PROBE_EVERY_N_POLLS) {
+                if ((!this._installed || this._compatible !== true) &&
+                    ++this._pollTick >= PROBE_EVERY_N_POLLS) {
                     this._pollTick = 0;
                     this._probeInstall();
                 }
@@ -210,22 +237,28 @@ export default class InputLockXExtension extends Extension {
         // _probeInstall() both reach for this._button through `?.`, so the
         // callbacks wired up above are safe until it exists.
         this._button = new InputLockButton(() => this._toggle());
-        this._button.setLocked(this._locked);
         Main.panel.addToStatusArea(this.uuid, this._button, 0, 'right');
-
+        this._button.setLocked(this._locked);
+        this._refresh();
         this._probeInstall();
     }
 
     disable() {
         // Deliberately does not stop the daemon. A lock that survives a shell
-        // restart is a feature: the grab is still releasable with Ctrl+Esc, and
-        // stopping it here would silently re-enable input on every lock screen.
+        // restart remains recoverable through the daemon's keyboard shortcut.
+        // Stopping it here would silently re-enable input on every lock screen.
 
         // The shell disables us on the lock screen, so an in-flight call or a
         // pending timeout would otherwise come back to a torn-down extension
         // and try to raise a notification from it.
         this._cancellable?.cancel();
         this._cancellable = null;
+        this._versionProcess?.force_exit();
+        this._versionProcess = null;
+        this._keepAwake?.destroy();
+        this._keepAwake = null;
+        this._pending = null;
+        this._closePrompt();
 
         if (this._reloadId) {
             Gio.DBus.system.signal_unsubscribe(this._reloadId);
@@ -240,11 +273,14 @@ export default class InputLockXExtension extends Extension {
         }
 
         if (this._monitor) {
-            this._monitor.disconnect(this._monitorId);
+            if (this._monitorId)
+                this._monitor.disconnect(this._monitorId);
             this._monitor.cancel();
             this._monitor = null;
-            this._monitorId = null;
+            this._monitorId = 0;
         }
+        this._stateFile = null;
+        this._promptFile = null;
 
         if (this._keybindingAdded) {
             Main.wm.removeKeybinding(KEYBINDING);
@@ -257,7 +293,7 @@ export default class InputLockXExtension extends Extension {
     }
 
     _readState() {
-        return Gio.File.new_for_path(STATE_PATH).query_exists(null);
+        return this._stateFile.query_exists(null);
     }
 
     /* Hold the shortcut only while there is a daemon to answer it. Ctrl+Esc is
@@ -274,11 +310,12 @@ export default class InputLockXExtension extends Extension {
      * holds the chord, which differs from wanted when the add is refused, and
      * is what disable() needs so it does not retract a binding it never got. */
     _syncKeybinding() {
-        if (!this._settings || this._installed === this._keybindingWanted)
+        const wanted = this._installed || this._locked;
+        if (!this._settings || wanted === this._keybindingWanted)
             return;
-        this._keybindingWanted = this._installed;
+        this._keybindingWanted = wanted;
 
-        if (!this._installed) {
+        if (!wanted) {
             if (this._keybindingAdded) {
                 Main.wm.removeKeybinding(KEYBINDING);
                 this._keybindingAdded = false;
@@ -309,9 +346,18 @@ export default class InputLockXExtension extends Extension {
      * way to arrive here. Say so on the icon rather than letting the first tap
      * fail with a D-Bus error nobody outside this project can read. */
     _probeInstall() {
-        probeUnit(this._cancellable, (state, error) => {
-            // disable() ran while the call was in flight.
-            if (!this._cancellable)
+        const cancellable = this._cancellable;
+        if (!cancellable)
+            return;
+
+        const generation = ++this._probeGeneration;
+        const isCurrent = () =>
+            this._cancellable === cancellable && this._probeGeneration === generation;
+        this._versionProcess?.force_exit();
+        this._versionProcess = null;
+
+        probeUnit(cancellable, (state, error) => {
+            if (!isCurrent())
                 return;
 
             if (error) {
@@ -331,6 +377,38 @@ export default class InputLockXExtension extends Extension {
 
             this._button?.setInstalled(this._installed);
             this._syncKeybinding();
+            if (this._installed)
+                this._probeProtocol(cancellable, isCurrent);
+            else
+                this._compatible = null;
+        });
+    }
+
+    _probeProtocol(cancellable, isCurrent) {
+        let process;
+        try {
+            process = Gio.Subprocess.new(
+                [DAEMON_PATH, '--protocol-version'],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE,
+            );
+        } catch (error) {
+            this._compatible = false;
+            console.warn(`[input-lock-x] Could not run the daemon version check: ${error.message}`);
+            return;
+        }
+        this._versionProcess = process;
+        process.communicate_utf8_async(null, cancellable, (_process, result) => {
+            if (!isCurrent())
+                return;
+
+            this._versionProcess = null;
+            try {
+                const [, version] = process.communicate_utf8_finish(result);
+                this._compatible = process.get_successful() && version?.trim() === DAEMON_PROTOCOL;
+            } catch (error) {
+                this._compatible = false;
+                console.warn(`[input-lock-x] Could not verify the daemon version: ${error.message}`);
+            }
         });
     }
 
@@ -339,46 +417,145 @@ export default class InputLockXExtension extends Extension {
      * monitor emits for a single create or delete. */
     _refresh() {
         const locked = this._readState();
+        this._keepAwake?.setLocked(locked);
+        this._syncPrompt(locked ? this._readPromptStatus() : null);
+        if (this._pending && locked) {
+            this._pending = null;
+            this._clearPendingTimeout();
+        }
         if (locked === this._locked)
             return;
 
         this._locked = locked;
-        this._pending = false;
+        this._syncKeybinding();
         this._button?.setLocked(locked);
         Main.notify(locked ? 'Input Disabled' : 'Input Enabled');
     }
 
+    _readPromptStatus() {
+        try {
+            const [, contents] = this._promptFile.load_contents(null);
+            const status = new TextDecoder().decode(contents).trim();
+            if (status === 'wrong')
+                return status;
+            const match = /^enter:([0-9]{1,2})$/.exec(status);
+            return match && Number(match[1]) <= PIN_MAX_DIGITS ? Number(match[1]) : null;
+        } catch (error) {
+            if (!error.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
+                console.warn(`[input-lock-x] Could not read PIN progress: ${error.message}`);
+            return null;
+        }
+    }
+
+    _syncPrompt(status) {
+        if (status === null) {
+            this._closePrompt();
+            return;
+        }
+        if (status === this._promptStatus)
+            return;
+
+        const instruction = 'Enter your Lock X PIN, then press Enter. Press Esc to cancel.';
+        const description = status === 'wrong' ? 'Incorrect PIN. Try again.' : instruction;
+        if (this._promptDialog) {
+            this._promptMessage.description = description;
+        } else {
+            const dialog = new ModalDialog.ModalDialog({
+                destroyOnClose: false,
+                shouldFadeIn: false,
+                shouldFadeOut: false,
+            });
+            this._promptDialog = dialog;
+            this._promptMessage = new Dialog.MessageDialogContent({
+                title: 'Unlock Input Lock X',
+                description,
+            });
+            this._promptProgress = new St.Label({
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+            dialog.contentLayout.add_child(this._promptMessage);
+            dialog.contentLayout.add_child(this._promptProgress);
+            try {
+                if (!dialog.open()) {
+                    this._closePrompt();
+                    return;
+                }
+            } catch (error) {
+                this._closePrompt();
+                console.warn(`[input-lock-x] Could not open the PIN prompt: ${error.message}`);
+                return;
+            }
+        }
+
+        this._promptStatus = status;
+        this._promptProgress.visible = typeof status === 'number' && status > 0;
+        this._promptProgress.text = typeof status === 'number' ? '●'.repeat(status) : '';
+        this._promptProgress.accessible_name = typeof status === 'number'
+            ? `PIN digits entered: ${status}`
+            : '';
+    }
+
+    _closePrompt() {
+        if (this._promptDialog) {
+            // Also release a native grab if opening stopped before the dialog
+            // was fully shown and close() would otherwise be a no-op.
+            this._promptDialog.popModal();
+            this._promptDialog.close();
+            this._promptDialog.destroy();
+            this._promptDialog = null;
+        }
+        this._promptMessage = null;
+        this._promptProgress = null;
+        this._promptStatus = null;
+    }
+
     _toggle() {
-        // The daemon is a separate, root-owned install step. Saying so is far
-        // more useful than letting StartUnit fail with a D-Bus error nobody
-        // outside this project can interpret.
+        const cancellable = this._cancellable;
+        if (!cancellable)
+            return;
+
+        this._refresh();
+        if (this._pending)
+            return;
+
+        if (this._locked) {
+            if (!this._promptDialog) {
+                Main.notify('Input Lock X',
+                    'Press Ctrl+Esc on the locked keyboard, then enter your Lock X PIN.');
+            }
+            return;
+        }
+
         if (!this._installed) {
             Main.notify('Input Lock X is not set up',
                 `${UNIT} is not installed. The extension needs its companion ` +
                 `daemon, which is installed separately: ${REPO_URL}`);
             return;
         }
-
-        if (this._pending)
+        if (this._compatible !== true) {
+            const message = this._compatible === null
+                ? 'Checking the installed daemon version. Try again in a moment.'
+                : 'Run make install-daemon from the Input Lock X project to update the daemon.';
+            Main.notify('Input Lock X cannot start yet', message);
             return;
-        this._pending = true;
+        }
 
-        const wantLocked = !this._locked;
-        const method = wantLocked ? 'StartUnit' : 'StopUnit';
+        const request = {};
+        this._pending = request;
 
         Gio.DBus.system.call(
             SYSTEMD_NAME, SYSTEMD_PATH, SYSTEMD_MANAGER,
-            method,
+            'StartUnit',
             new GLib.Variant('(ss)', [UNIT, 'replace']),
             null,
             Gio.DBusCallFlags.NONE,
             -1,
-            this._cancellable,
+            cancellable,
             (connection, result) => {
                 // A reply already in flight when disable() ran still lands
                 // here; cancelling cannot recall it. Without this the success
                 // path below would arm a timeout nothing will ever remove.
-                if (!this._cancellable)
+                if (this._cancellable !== cancellable || this._pending !== request)
                     return;
 
                 try {
@@ -386,18 +563,20 @@ export default class InputLockXExtension extends Extension {
                 } catch (e) {
                     if (e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                         return;
-                    this._pending = false;
-                    console.error(`[input-lock-x] ${method} failed: ${e.message}`);
+                    this._pending = null;
+                    console.error(`[input-lock-x] StartUnit failed: ${e.message}`);
                     Main.notify(...this._failureMessage(e));
                     return;
                 }
 
-                // StartUnit/StopUnit return once the job is *enqueued*, not
+                // StartUnit returns once the job is *enqueued*, not
                 // once it has run -- so this success says nothing about
                 // whether the daemon grabbed anything. A unit that fails to
                 // start still replies successfully here. The state file is
                 // the only thing that actually answers the question.
-                this._awaitState(wantLocked, 0);
+                this._refresh();
+                if (this._pending === request)
+                    this._awaitState(request);
             });
     }
 
@@ -412,28 +591,22 @@ export default class InputLockXExtension extends Extension {
      * say so. Complements the file monitor: the monitor keeps the icon honest,
      * this turns a lock that never engaged into a visible failure rather than
      * a tap that silently did nothing. */
-    _awaitState(wantLocked, attempt) {
-        this._clearPendingTimeout();
+    _awaitState(request) {
+        let attempts = 0;
         this._pendingId = GLib.timeout_add(
             GLib.PRIORITY_DEFAULT, SETTLE_INTERVAL_MS, () => {
-                this._pendingId = 0;
+                // _refresh() can complete the request and clear this source.
                 this._refresh();
-
-                if (this._locked === wantLocked) {
-                    this._pending = false;
+                if (this._pending !== request)
                     return GLib.SOURCE_REMOVE;
-                }
+                if (++attempts < SETTLE_ATTEMPTS)
+                    return GLib.SOURCE_CONTINUE;
 
-                if (attempt + 1 >= SETTLE_ATTEMPTS) {
-                    this._pending = false;
-                    const verb = wantLocked ? 'engage' : 'release';
-                    console.error(`[input-lock-x] ${UNIT} did not ${verb}`);
-                    Main.notify('Input lock toggle failed',
-                        `${UNIT} did not ${verb} — check journalctl -u ${UNIT}`);
-                    return GLib.SOURCE_REMOVE;
-                }
-
-                this._awaitState(wantLocked, attempt + 1);
+                this._pendingId = 0;
+                this._pending = null;
+                console.error(`[input-lock-x] ${UNIT} did not engage`);
+                Main.notify('Input lock failed',
+                    `${UNIT} did not engage. Check journalctl -u ${UNIT}.`);
                 return GLib.SOURCE_REMOVE;
             });
     }

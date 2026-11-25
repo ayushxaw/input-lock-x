@@ -1,5 +1,6 @@
 # Copyright (C) 2026 Isak Lindgren
 # SPDX-License-Identifier: GPL-2.0-or-later
+# Build and test updates by ayushxaw, 2026-11-25.
 
 UUID := input-lock-x@isalin.github.io
 EXT_DIR := $(HOME)/.local/share/gnome-shell/extensions/$(UUID)
@@ -87,7 +88,7 @@ check:
 	@# dependency, and `make pack` runs this target -- so a machine without
 	@# node must still be able to build the zip.
 	@if command -v node >/dev/null 2>&1; then \
-		for f in extension/extension.js extension/prefs.js extension/common.js; do \
+		for f in extension/extension.js extension/prefs.js extension/common.js extension/keepAwake.js; do \
 			t=$$(mktemp --suffix=.mjs) && cp "$$f" "$$t" && \
 			node --check "$$t"; rc=$$?; rm -f "$$t"; \
 			[ $$rc -eq 0 ] || exit $$rc; \
@@ -105,6 +106,11 @@ check:
 # machine before handing it the keyboard.
 test:
 	@python3 -m unittest discover -s tests -p 'test_*.py'
+	@if command -v gjs >/dev/null 2>&1 && command -v dbus-run-session >/dev/null 2>&1; then \
+		GIO_USE_VFS=local dbus-run-session -- gjs -m tests/test-keep-awake.js; \
+	else \
+		echo "gjs or dbus-run-session unavailable, keep-awake test skipped"; \
+	fi
 	@bash tests/test-path-ownership.sh
 	@python3 tests/classify-from-proc.py
 
@@ -117,7 +123,7 @@ pack: check
 	@cp -r extension $(BUILD)/src
 	@rm -f $(BUILD)/src/schemas/gschemas.compiled
 	@cp LICENSE $(BUILD)/src/LICENSE
-	@gnome-extensions pack --force -o $(BUILD) --extra-source=LICENSE --extra-source=common.js $(BUILD)/src
+	@gnome-extensions pack --force -o $(BUILD) --extra-source=LICENSE --extra-source=common.js --extra-source=keepAwake.js $(BUILD)/src
 	@rm -rf $(BUILD)/src
 	@echo
 	@echo "$(BUILD)/$(UUID).shell-extension.zip"

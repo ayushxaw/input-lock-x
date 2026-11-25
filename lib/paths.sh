@@ -1,5 +1,6 @@
 # Copyright (C) 2026 Isak Lindgren
 # SPDX-License-Identifier: GPL-2.0-or-later
+# PIN configuration and migration paths by ayushxaw, 2026-11-25.
 #
 # Everything the current generation of this tool installs.
 # shellcheck shell=bash
@@ -15,6 +16,7 @@
 UUID="input-lock-x@isalin.github.io"
 UNIT="input-lock-x.service"
 CONF="/etc/input-lock-x.conf"
+PIN_CONF="/etc/input-lock-x.pin"
 STATE="/run/input-lock-x.state"
 DCONF_PATH="/org/gnome/shell/extensions/input-lock-x/"
 EXT_DIR="${HOME}/.local/share/gnome-shell/extensions/${UUID}"
@@ -24,6 +26,8 @@ POLKIT_RULE="/etc/polkit-1/rules.d/49-input-lock-x.rules"
 SUDOERS="/etc/sudoers.d/input-lock-x"
 CLI="/usr/local/bin/input-lock-x"
 UNLOCK="/usr/local/bin/input-lock-x-emergency-unlock"
+# Cleanup-only path from the password-gated release flow.
+PASSWORD_UNLOCK="/usr/local/bin/input-lock-x-password-unlock"
 # /usr/local/bin so SELinux labels it bin_t. From /usr/local/lib (lib_t) there
 # is no domain transition, the service runs as init_t, and every
 # /dev/input/event* open fails with EACCES even though the service is root.
@@ -37,14 +41,14 @@ DAEMON_BIN="/usr/local/bin/input-lock-x-daemon"
 # failed release while input is perfectly fine.
 DAEMON_PATTERN="$DAEMON_BIN"
 
-# Removable files. Not CONF: a config may have been edited by hand, so it is
-# left on disk and only mentioned in the closing message.
+# Leave the config and PIN enrollment in place for reinstallations.
 FILES=(
     "$UNIT_FILE"
     "$POLKIT_RULE"
     "$SUDOERS"
     "$CLI"
     "$UNLOCK"
+    "$PASSWORD_UNLOCK"
     "$DAEMON_BIN"
 )
 

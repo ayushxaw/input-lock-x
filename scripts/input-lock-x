@@ -10,6 +10,8 @@
 #
 # For the case where things are already wedged, use input-lock-x-emergency-unlock.
 
+# Updated PIN unlock instructions by ayushxaw, 2026-11-25.
+
 set -u
 
 UNIT="input-lock-x.service"
@@ -84,7 +86,7 @@ case "${1:-}" in
             exit 1
         fi
         if is_locked; then
-            echo "input lock engaged (Ctrl+Esc on the laptop releases it)"
+            echo "input lock engaged (press Ctrl+Esc and enter your Lock X PIN)"
         else
             echo "unit started but $STATE is missing; lock is NOT engaged" >&2
             exit 1

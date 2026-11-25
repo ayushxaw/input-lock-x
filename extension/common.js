@@ -1,6 +1,7 @@
 /* Input Lock X -- shared between extension.js and prefs.js
  * Copyright (C) 2026 Isak Lindgren
  * SPDX-License-Identifier: GPL-2.0-or-later
+ * Project links by ayushxaw, 2026-11-25.
  *
  * The panel button and the preferences page both need to know what the unit is
  * called and whether it exists. Keeping one copy is not tidiness: the first
@@ -14,7 +15,7 @@ import GLib from 'gi://GLib';
 export const UNIT = 'input-lock-x.service';
 export const STATE_PATH = '/run/input-lock-x.state';
 export const KEYBINDING = 'toggle-hid';
-export const REPO_URL = 'https://github.com/isalin/input-lock-x';
+export const REPO_URL = 'https://github.com/ayushxaw/input-lock-x';
 
 export const SYSTEMD_NAME = 'org.freedesktop.systemd1';
 export const SYSTEMD_PATH = '/org/freedesktop/systemd1';

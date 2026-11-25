@@ -1,9 +1,10 @@
 # Copyright (C) 2026 Isak Lindgren
 # SPDX-License-Identifier: GPL-2.0-or-later
+# Watchdog and recovery changes by ayushxaw, 2026-11-25.
 #
 [Unit]
 Description=Input Lock X (grabs the internal keyboard and touchpad)
-Documentation=https://github.com/isalin/input-lock-x
+Documentation=https://github.com/ayushxaw/input-lock-x
 
 [Service]
 # notify, not simple: the daemon signals READY=1 only once the devices are
@@ -17,12 +18,16 @@ NotifyAccess=main
 # and get EACCES opening /dev/input/event* -- even as root. bin_t transitions
 # to unconfined_service_t, which can read input devices.
 ExecStart=/usr/local/bin/input-lock-x-daemon
-# Guarantees the state file is gone even if the daemon was SIGKILLed.
-ExecStopPost=/usr/bin/rm -f /run/input-lock-x.state
+# Remove both runtime markers even if the daemon was SIGKILLed.
+ExecStopPost=/usr/bin/rm -f /run/input-lock-x.state /run/input-lock-x.auth
 # Deliberately no restart: a crash-looping daemon that keeps re-grabbing the
 # keyboard is the one failure mode we must never have.
 Restart=no
-TimeoutStopSec=5
+# Release kernel grabs even if the daemon gets stuck in its event loop.
+WatchdogSec=15s
+WatchdogSignal=SIGKILL
+TimeoutStartSec=15s
+TimeoutStopSec=5s
 
 # No [Install] section on purpose. This unit is started on demand only and must
 # never be enabled at boot.
