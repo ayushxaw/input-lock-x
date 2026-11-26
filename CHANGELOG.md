@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Prevent installer migration from assigning GNOME's screen-lock shortcut to
+  Input Lock X. Super+L remains available for the normal desktop lock screen.
+
 ## 1.0.0 — 2026-08-30
 
 Initial public release of Input Lock X:

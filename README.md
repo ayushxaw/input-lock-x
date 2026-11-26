@@ -191,7 +191,9 @@ files are left in `/etc` so they can be reviewed or removed manually. An
 extension directory that this installer did not create is left alone.
 
 Older installations named `minibookx-hid-lock` are migrated automatically by
-`install.sh`; their config and shortcut are carried over.
+`install.sh`. Their config and a non-conflicting shortcut are carried over. If
+the old shortcut is also GNOME's screen-lock shortcut, Input Lock X uses its
+safe default, **Ctrl+Esc**, so **Super+L** continues to lock the desktop.
 
 ## Usage
 

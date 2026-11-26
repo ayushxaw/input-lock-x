@@ -350,12 +350,26 @@ if [[ $legacy_present -eq 1 ]]; then
     fi
 
     # dconf, not gsettings: the old schema is about to stop existing, and dconf
-    # addresses keys by path without needing one.
+    # addresses keys by path without needing one. Never carry over the desktop
+    # screen-lock shortcut: giving Input Lock X Super+L makes Win+L grab input
+    # instead of locking the session. In that case the new extension keeps its
+    # safe Ctrl+Esc default.
     if command -v dconf >/dev/null 2>&1; then
         old_binding="$(dconf read "${LEGACY_DCONF_PATH}toggle-hid" 2>/dev/null || true)"
         if [[ -n "$old_binding" ]]; then
-            dconf write "${DCONF_PATH}toggle-hid" "$old_binding"
-            echo "   keybinding carried over: $old_binding"
+            screen_lock_binding=""
+            if command -v gsettings >/dev/null 2>&1; then
+                screen_lock_binding="$(gsettings get \
+                    org.gnome.settings-daemon.plugins.media-keys screensaver \
+                    2>/dev/null || true)"
+            fi
+            if [[ -n "$screen_lock_binding" && \
+                    "$old_binding" == "$screen_lock_binding" ]]; then
+                echo "   old keybinding is GNOME's screen lock; using Ctrl+Esc"
+            else
+                dconf write "${DCONF_PATH}toggle-hid" "$old_binding"
+                echo "   keybinding carried over: $old_binding"
+            fi
         fi
         dconf reset -f "$LEGACY_DCONF_PATH" 2>/dev/null || true
     fi
