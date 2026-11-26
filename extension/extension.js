@@ -36,6 +36,7 @@ import {
     UNIT, STATE_PATH, KEYBINDING, REPO_URL,
     SYSTEMD_NAME, SYSTEMD_PATH, SYSTEMD_MANAGER,
     probeUnit, isAuthDenied, AUTH_DENIED_HINT,
+    getScreenLockSettings, getScreenLockShortcuts, SCREEN_LOCK_KEYS, availableShortcuts,
 } from './common.js';
 import {KeepAwake} from './keepAwake.js';
 
@@ -176,6 +177,18 @@ export default class InputLockXExtension extends Extension {
         this._keepAwake = new KeepAwake();
 
         this._settings = this.getSettings();
+        this._bindingSettings = new Gio.Settings({
+            settings_schema: this._settings.settings_schema,
+            backend: Gio.memory_settings_backend_new(),
+        });
+        this._screenLockSettings = getScreenLockSettings();
+        this._settingsChangedId = this._settings.connect(
+            `changed::${KEYBINDING}`, () => this._updateShortcuts());
+        this._screenLockChangedId = this._screenLockSettings?.connect('changed', (_settings, key) => {
+            if (SCREEN_LOCK_KEYS.includes(key))
+                this._updateShortcuts();
+        });
+        this._updateShortcuts();
         // _installed is still optimistically true here, so a normal install
         // binds immediately; the probe below unbinds within milliseconds if
         // the daemon turns out to be missing.
@@ -232,15 +245,25 @@ export default class InputLockXExtension extends Extension {
                 return GLib.SOURCE_CONTINUE;
             });
 
-        // Registered last, on purpose: this is the only thing the shell holds a
-        // reference to by name, so nothing above can strand it. _refresh() and
-        // _probeInstall() both reach for this._button through `?.`, so the
-        // callbacks wired up above are safe until it exists.
-        this._button = new InputLockButton(() => this._toggle());
-        Main.panel.addToStatusArea(this.uuid, this._button, 0, 'right');
-        this._button.setLocked(this._locked);
+        this._addIndicator();
         this._refresh();
         this._probeInstall();
+    }
+
+    _addIndicator() {
+        const button = new InputLockButton(() => this._toggle());
+        try {
+            Main.panel.addToStatusArea(this.uuid, button, 0, 'right');
+            button.setLocked(this._locked);
+            this._button = button;
+        } catch (error) {
+            // Another extension can break panel insertion after GNOME has
+            // already stored the role. Clean up our button and keep Ctrl+Esc.
+            if (Main.panel.statusArea[this.uuid] === button)
+                delete Main.panel.statusArea[this.uuid];
+            button.destroy();
+            console.warn(`[input-lock-x] Could not add panel indicator: ${error.message}`);
+        }
     }
 
     disable() {
@@ -286,6 +309,14 @@ export default class InputLockXExtension extends Extension {
             Main.wm.removeKeybinding(KEYBINDING);
             this._keybindingAdded = false;
         }
+        if (this._settingsChangedId)
+            this._settings.disconnect(this._settingsChangedId);
+        if (this._screenLockChangedId)
+            this._screenLockSettings.disconnect(this._screenLockChangedId);
+        this._settingsChangedId = 0;
+        this._screenLockChangedId = 0;
+        this._bindingSettings = null;
+        this._screenLockSettings = null;
         this._settings = null;
 
         this._button?.destroy();
@@ -294,6 +325,15 @@ export default class InputLockXExtension extends Extension {
 
     _readState() {
         return this._stateFile.query_exists(null);
+    }
+
+    _updateShortcuts() {
+        // GNOME sees just the safe bindings. Keep the user's choices on disk
+        // so a custom shortcut can work again if the conflict goes away.
+        const configured = this._settings.get_strv(KEYBINDING);
+        const defaults = this._settings.get_default_value(KEYBINDING).deepUnpack();
+        const reserved = getScreenLockShortcuts(this._screenLockSettings);
+        this._bindingSettings.set_strv(KEYBINDING, availableShortcuts(configured, defaults, reserved));
     }
 
     /* Hold the shortcut only while there is a daemon to answer it. Ctrl+Esc is
@@ -311,7 +351,7 @@ export default class InputLockXExtension extends Extension {
      * is what disable() needs so it does not retract a binding it never got. */
     _syncKeybinding() {
         const wanted = this._installed || this._locked;
-        if (!this._settings || wanted === this._keybindingWanted)
+        if (!this._bindingSettings || wanted === this._keybindingWanted)
             return;
         this._keybindingWanted = wanted;
 
@@ -325,7 +365,7 @@ export default class InputLockXExtension extends Extension {
 
         const action = Main.wm.addKeybinding(
             KEYBINDING,
-            this._settings,
+            this._bindingSettings,
             Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
             Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW,
             () => this._toggle());

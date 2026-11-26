@@ -106,6 +106,11 @@ check:
 # machine before handing it the keyboard.
 test:
 	@python3 -m unittest discover -s tests -p 'test_*.py'
+	@if command -v gjs >/dev/null 2>&1; then \
+		gjs -m tests/test-shortcuts.js; \
+	else \
+		echo "gjs unavailable, shortcut test skipped"; \
+	fi
 	@if command -v gjs >/dev/null 2>&1 && command -v dbus-run-session >/dev/null 2>&1; then \
 		GIO_USE_VFS=local dbus-run-session -- gjs -m tests/test-keep-awake.js; \
 	else \

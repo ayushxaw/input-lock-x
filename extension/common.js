@@ -17,6 +17,64 @@ export const STATE_PATH = '/run/input-lock-x.state';
 export const KEYBINDING = 'toggle-hid';
 export const REPO_URL = 'https://github.com/ayushxaw/input-lock-x';
 
+const SCREEN_LOCK_SCHEMA = 'org.gnome.settings-daemon.plugins.media-keys';
+export const SCREEN_LOCK_KEYS = ['screensaver', 'screensaver-static'];
+const RESERVED_SHORTCUTS = ['<Super>l', 'XF86ScreenSaver'];
+const MODIFIERS = new Map([
+    ['control', 'control'], ['primary', 'control'], ['ctrl', 'control'], ['ctl', 'control'],
+    ['shift', 'shift'], ['shft', 'shift'],
+    ['alt', 'alt'], ['mod1', 'alt'],
+    ['super', 'super'], ['mod4', 'super'],
+    ['meta', 'meta'], ['hyper', 'hyper'], ['mod2', 'mod2'],
+    ['mod3', 'mod3'], ['mod5', 'mod5'],
+]);
+
+export function getScreenLockSettings() {
+    const schema = Gio.SettingsSchemaSource.get_default()?.lookup(SCREEN_LOCK_SCHEMA, true);
+    return schema ? new Gio.Settings({settings_schema: schema}) : null;
+}
+
+export function getScreenLockShortcuts(settings) {
+    const shortcuts = [...RESERVED_SHORTCUTS];
+    for (const key of SCREEN_LOCK_KEYS) {
+        if (settings?.settings_schema.has_key(key))
+            shortcuts.push(...settings.get_strv(key));
+    }
+    return shortcuts.filter(shortcut => shortcut && shortcut !== 'disabled');
+}
+
+function shortcutParts(shortcut) {
+    const [prefix] = shortcut.toLowerCase().match(/^(?:<[^<>]+>)*/);
+    const modifiers = new Set();
+    for (const [, modifier] of prefix.matchAll(/<([^<>]+)>/g)) {
+        // Mutter ignores unknown modifier tags.
+        if (MODIFIERS.has(modifier))
+            modifiers.add(MODIFIERS.get(modifier));
+    }
+    let key = shortcut.slice(prefix.length).toLowerCase();
+    if (key === 'screensaver')
+        key = 'xf86screensaver';
+    return [[...modifiers].sort().join('+'), key];
+}
+
+export function conflictsWithScreenLock(shortcut, reserved) {
+    const [mods, key] = shortcutParts(shortcut);
+    return reserved.some(binding => {
+        const [otherMods, otherKey] = shortcutParts(binding);
+        // Raw keycodes depend on the layout. Keep the chord reserved if either
+        // side uses a keycode with the same modifiers.
+        return mods === otherMods &&
+            (key === otherKey || key.startsWith('0x') || otherKey.startsWith('0x'));
+    });
+}
+
+export function availableShortcuts(configured, defaults, reserved) {
+    const allowed = configured.filter(shortcut => !conflictsWithScreenLock(shortcut, reserved));
+    if (configured.length && !allowed.length)
+        return defaults.filter(shortcut => !conflictsWithScreenLock(shortcut, reserved));
+    return allowed;
+}
+
 export const SYSTEMD_NAME = 'org.freedesktop.systemd1';
 export const SYSTEMD_PATH = '/org/freedesktop/systemd1';
 export const SYSTEMD_MANAGER = 'org.freedesktop.systemd1.Manager';

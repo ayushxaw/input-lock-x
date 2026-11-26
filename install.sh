@@ -356,7 +356,8 @@ if [[ $legacy_present -eq 1 ]]; then
     # safe Ctrl+Esc default.
     if command -v dconf >/dev/null 2>&1; then
         old_binding="$(dconf read "${LEGACY_DCONF_PATH}toggle-hid" 2>/dev/null || true)"
-        if [[ -n "$old_binding" ]]; then
+        current_binding="$(dconf read "${DCONF_PATH}toggle-hid" 2>/dev/null || true)"
+        if [[ -n "$old_binding" && -z "$current_binding" ]]; then
             screen_lock_binding=""
             if command -v gsettings >/dev/null 2>&1; then
                 screen_lock_binding="$(gsettings get \

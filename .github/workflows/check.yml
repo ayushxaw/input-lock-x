@@ -43,11 +43,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # glib-compile-schemas is the only one not already on the runner image.
-      - name: Install glib-compile-schemas
+      - name: Install GLib tools and GJS
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libglib2.0-bin
+          sudo apt-get install -y --no-install-recommends libglib2.0-bin gjs gsettings-desktop-schemas dbus-daemon
 
       # Pinned, not the runner image's copy. `make check` runs shellcheck at
       # its default severity, which includes style and info -- so a shellcheck
@@ -71,7 +70,7 @@ jobs:
       - name: Verify every checker make check can skip is present
         run: |
           set -euo pipefail
-          for tool in shellcheck node python3 awk glib-compile-schemas; do
+          for tool in shellcheck node python3 awk glib-compile-schemas gjs dbus-run-session; do
             if ! command -v "$tool" >/dev/null; then
               echo "::error::$tool is missing -- make check would skip it silently"
               exit 1

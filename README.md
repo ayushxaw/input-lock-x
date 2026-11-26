@@ -206,8 +206,13 @@ input-lock-x toggle   # switch between the two states
 input-lock-x status   # show state and matched devices
 ```
 
-The default shortcut engages the lock. To change the shortcut that engages
-the lock, use **Extensions → Input Lock X → Settings** or run:
+**Ctrl+Esc** engages Input Lock X. **Super+L** (Win+L) opens GNOME's normal
+lock screen when Input Lock X is off. If a saved Input Lock X shortcut overlaps
+with GNOME's screen lock, Input Lock X skips the conflicting binding and uses
+Ctrl+Esc when no other configured binding is available.
+
+To change the shortcut that engages Input Lock X, use
+**Extensions → Input Lock X → Settings**, or restore Ctrl+Esc from a terminal:
 
 ```sh
 gsettings --schemadir \

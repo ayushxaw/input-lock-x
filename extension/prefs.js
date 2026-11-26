@@ -19,7 +19,11 @@ import Gtk from 'gi://Gtk';
 
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
-import {UNIT, KEYBINDING, REPO_URL, probeUnit} from './common.js';
+import {
+    UNIT, KEYBINDING, REPO_URL, probeUnit,
+    getScreenLockSettings, getScreenLockShortcuts, conflictsWithScreenLock,
+    availableShortcuts, SCREEN_LOCK_KEYS,
+} from './common.js';
 
 /* Keysyms that are only ever half of a chord. Pressing Ctrl arrives here as a
  * key press in its own right, and treating it as a candidate binding would
@@ -84,24 +88,35 @@ export default class InputLockXPreferences extends ExtensionPreferences {
             valign: Gtk.Align.CENTER,
         });
 
-        const sync = () => {
-            const [accel] = settings.get_strv(KEYBINDING);
-            label.accelerator = accel ?? '';
-        };
-        sync();
-        const changedId = settings.connect(`changed::${KEYBINDING}`, sync);
-        // The settings object is owned by this prefs window; disconnect anyway
-        // so a reopened window does not stack handlers on a cached instance.
-        window.connect('close-request', () => {
-            settings.disconnect(changedId);
-            return false;
-        });
-
         const row = new Adw.ActionRow({
             title: 'Engage Input Lock X',
             activatable: true,
         });
         row.add_suffix(label);
+
+        const screenLockSettings = getScreenLockSettings();
+        const sync = () => {
+            const configured = settings.get_strv(KEYBINDING);
+            const defaults = settings.get_default_value(KEYBINDING).deepUnpack();
+            const reserved = getScreenLockShortcuts(screenLockSettings);
+            const [accel] = availableShortcuts(configured, defaults, reserved);
+            label.accelerator = accel ?? '';
+            row.subtitle = configured.some(shortcut => conflictsWithScreenLock(shortcut, reserved))
+                ? 'GNOME reserves your original shortcut for the screen lock.'
+                : '';
+        };
+        const changedId = settings.connect(`changed::${KEYBINDING}`, sync);
+        const screenLockChangedId = screenLockSettings?.connect('changed', (_settings, key) => {
+            if (SCREEN_LOCK_KEYS.includes(key))
+                sync();
+        });
+        sync();
+        window.connect('close-request', () => {
+            settings.disconnect(changedId);
+            if (screenLockChangedId)
+                screenLockSettings.disconnect(screenLockChangedId);
+            return false;
+        });
 
         const reset = new Gtk.Button({
             icon_name: 'edit-clear-symbolic',
@@ -112,7 +127,7 @@ export default class InputLockXPreferences extends ExtensionPreferences {
         reset.connect('clicked', () => settings.reset(KEYBINDING));
         row.add_suffix(reset);
 
-        row.connect('activated', () => this._captureShortcut(window, settings));
+        row.connect('activated', () => this._captureShortcut(window, settings, screenLockSettings));
         group.add(row);
 
         group.add(new Adw.ActionRow({
@@ -130,7 +145,7 @@ export default class InputLockXPreferences extends ExtensionPreferences {
     /* A modal window that exists only to receive one key press. Deliberately
      * not an Adw.AlertDialog -- that is libadwaita 1.5, and this extension
      * claims GNOME 45. */
-    _captureShortcut(window, settings) {
+    _captureShortcut(window, settings, screenLockSettings) {
         const content = new Adw.StatusPage({
             title: 'Press the new shortcut',
             description: 'Backspace clears it, Esc keeps the current one.',
@@ -199,6 +214,10 @@ export default class InputLockXPreferences extends ExtensionPreferences {
             // still round-trip to something the shell can match.
             const accel = Gtk.accelerator_name_with_keycode(
                 null, keyval, keycode, mask);
+            if (conflictsWithScreenLock(accel, getScreenLockShortcuts(screenLockSettings))) {
+                content.description = 'GNOME uses that shortcut to lock the desktop. Choose another one.';
+                return Gdk.EVENT_STOP;
+            }
             settings.set_strv(KEYBINDING, [accel]);
             capture.destroy();
             return Gdk.EVENT_STOP;
